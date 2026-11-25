@@ -69,6 +69,24 @@ no name is needed. Saying just "Claude?" gets a "Yes?". All of this lives in one
 
 "switch to *project*", "which projects", "voice help", "stop listening".
 
+### Spoken slash commands, on purpose
+
+A `/` that happens to appear in a transcript never runs anything (it's stripped). To run a
+command deliberately, say **"command *name*"** or **"slash *name*"**: "Claude, command compact",
+"command wrap session". Only names in the `commands` allowlist run; anything else is sent to
+Claude as an ordinary sentence. The default list is the built-ins `clear` and `compact`.
+`clear` asks "Clear this conversation? Say yes." and runs only if your next words start with
+yes (silence or anything else cancels). Add your own skills to the list:
+
+```json
+"commands": {"clear": {"confirm": true, "reply": false, "ask": "Clear this conversation?"},
+             "compact": {"reply": false}, "my-skill": {}, "deploy": {"confirm": true}}
+```
+
+`reply: false` is for commands Claude doesn't answer, so the mic doesn't wait for a reply. Shell
+commands (`!`) can never be spoken. In the desktop app, Claude can run skills from the list for
+you, but built-ins like `/clear` have to be typed.
+
 ### Several sessions, one mic
 
 Every `Stop` hook writes a small registry entry: project folder name → iTerm session id. "switch to
@@ -113,6 +131,7 @@ are only here for explanation: the real file is plain JSON.)
     "silence_seconds": 2.5,   // quiet this long = you're done
     "wake": false,            // true = always use the wake word
     "follow_up_seconds": 30,
+    "commands": {"clear": {"confirm": true, "reply": false}, "compact": {"reply": false}},
     "idle_minutes": 20,       // mic off after this long with nothing sent
     "prompt": "Claude, Claude Code, iTerm, GitHub, …",   // vocabulary hint for Whisper
     "replacements": {"claude code": "Claude Code"},     // spelling fixes, applied after
@@ -120,7 +139,8 @@ are only here for explanation: the real file is plain JSON.)
     "sound_volume": 0.3,
     "sound_volumes": {},      // per-cue override, e.g. {"listening": 0.6}
     // advanced: "preroll": 0.5, "max_seconds": 60, "cooldown": 0.6, "reply_timeout": 600,
-    // "pane_check_seconds": 60, "stop_phrases": ["stop listening"], "model", "vad_model"
+    // "pane_check_seconds": 60, "stop_phrases": ["stop listening"], "confirm_seconds": 8,
+    // "model", "vad_model"
   }
 }
 ```

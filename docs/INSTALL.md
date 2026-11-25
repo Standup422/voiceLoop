@@ -96,6 +96,8 @@ In a Claude Code session:
 (or `voice listen` with no wake word, if you're alone). Then talk. A 2.5-second pause sends what you said.
 - "**switch to** *project*" moves the mic to another open Claude session; "**which projects**"
   lists them. Projects show up after they've finished one reply.
+- "**command** *name*" runs an allowed slash command: "command compact", or "command clear",
+  which asks you to say yes first. Add your own skills to `"commands"` in the config.
 - "**stop listening**" turns the mic off.
 
 ### Good to know

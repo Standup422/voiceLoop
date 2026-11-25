@@ -11,6 +11,8 @@
 #          press Enter -> close the mic until the reply has been spoken
 #          (voice-speak.py) -> listen again. Local commands (never sent to Claude):
 #          "switch to <project>", "which projects", "voice help", "stop listening".
+#          Spoken slash commands: "command clear" / "slash compact" -> /clear, /compact,
+#          ONLY for names in "commands" (config); "clear" asks for a spoken yes first.
 #          Wake mode (--wake / `voice listen wake`): only "Claude, …" is sent, plus
 #          a 30 s follow-up window after each reply.
 #          Panes are known from the registry voice-speak.py's Stop hook writes.
@@ -83,6 +85,13 @@ DEFAULTS = {
     "sounds": {"listening": "Tink", "accepted": "Purr", "ready": "", "stopped": "Basso"},
     "sound_volume": 0.3,
     "sound_volumes": {},         # per-cue override, e.g. {"listening": 0.6}
+    # Spoken slash commands: "command clear" / "slash compact" types /clear, /compact. ONLY
+    # names listed here run; anything else is sent to Claude as an ordinary sentence.
+    # confirm = ask "…? Say yes." first; reply = False for commands Claude doesn't answer
+    # (the mic must not wait for a spoken reply that never comes).
+    "commands": {"clear": {"confirm": True, "reply": False, "ask": "Clear this conversation?"},
+                 "compact": {"reply": False}},
+    "confirm_seconds": 8,        # how long a confirmation waits for "yes"
     "idle_minutes": 20,          # nothing sent for this long -> stop listening (mic off)
     "pane_check_seconds": 60,    # while idle, re-check that Claude still runs in the pane
 }
@@ -458,8 +467,35 @@ SWITCH = re.compile(r"^(?:ok(?:ay)?,?\s+|please\s+)?switch(?:\s+over)?\s+to\s+(?
                     r"(?:project\s+)?(.+?)(?:\s+project)?[\s.!?]*$", re.I)
 LIST = re.compile(r"^(?:which|what|list)(?:\s+the)?\s+projects?\b", re.I)
 HELP = re.compile(r"^voice\s+help\b", re.I)
-HELP_TEXT = ("Say: switch to, and a project name. Which projects. Or stop listening. "
-             "Anything else goes to Claude.")
+HELP_TEXT = ("Say: switch to, and a project name. Which projects. Command, and a command name. "
+             "Or stop listening. Anything else goes to Claude.")
+
+# Spoken slash commands, on purpose: a trigger word ("command" / "slash") + an allowlist
+# (cfg["commands"]) + an optional spoken yes. A stray "/" in a transcript never runs
+# anything (defang); this path does, deliberately. Unknown names fall through to Claude.
+COMMAND = re.compile(r"^(?:please\s+)?(?:run\s+)?(?:the\s+)?(?:command|slash)[\s,:.-]+(.+?)[\s.!?]*$", re.I)
+YES = re.compile(r"^(?:yes|yeah|yep|yup|sure|do it|confirm(?:ed)?|go ahead)\b", re.I)
+
+
+def parse_command(text: str, allowed: dict):
+    """'command wrap session' -> ("wrap-session", {opts}) when allowed, else None."""
+    m = COMMAND.match(text.strip())
+    if not m or not allowed:
+        return None
+    names = {norm(k): k for k in allowed}
+    hit = difflib.get_close_matches(norm(m.group(1)), list(names), n=1, cutoff=0.8)
+    return (names[hit[0]], dict(allowed[names[hit[0]]] or {})) if hit else None
+
+
+def confirm_by_voice(cfg: dict, wav: str, cwd: str = "", rec=None, stt=None) -> bool:
+    """After the question was asked: True only if the next utterance starts with yes."""
+    rec = rec or record
+    stt = stt or (lambda c, w: clean(transcribe(c, w), c))
+    if rec(cfg, wav, deadline=time.time() + float(cfg["confirm_seconds"])) != "ok":
+        return False
+    answer = strip_wake(stt(effective(cfg, cwd), wav))[0]
+    log(f"confirmation heard: {answer!r}")
+    return bool(YES.match(answer))
 
 
 # Wake word: a check on the TEXT, since Whisper already transcribes every utterance
@@ -646,6 +682,9 @@ def listen_once(cfg: dict, timeout: float, wake: bool = False, cwd: str = "",
                 cue(cfg, "stopped", block=True)
                 return {"status": "stop", "heard": text}
             cue(cfg, "accepted")
+            cmd = parse_command(text, cfg["commands"])
+            if cmd:   # the app can't type a slash command; the session decides (see /voice-app)
+                return {"status": "command", "heard": text, "command": cmd[0]}
             return {"status": "heard", "heard": text}
     if gate.pending:   # an unfinished sentence when time ran out: still better than losing it
         return {"status": "heard", "heard": gate.pending}
@@ -751,21 +790,34 @@ def loop(iterm_sid: str, claude_sid: str, cfg: dict, wake: bool = False) -> None
                 cue(cfg, "stopped", block=True)
                 say_local("Stopped listening.")
                 return
-            m = SWITCH.match(text)
+            outgoing, expect_reply = text, True
+            cmd = parse_command(text, cfg["commands"])
+            if cmd:
+                name, opts = cmd
+                if opts.get("confirm"):
+                    cue(cfg, "listening", block=True)
+                    say_local(f"{opts.get('ask') or 'Run ' + name.replace('-', ' ') + '?'} Say yes.")
+                    if not confirm_by_voice(cfg, wav, cwd):
+                        log(f"command /{name} NOT confirmed; nothing sent")
+                        say_local("Cancelled.")
+                        continue
+                outgoing, expect_reply = "/" + name, bool(opts.get("reply", True))
+                log(f"command: /{name}")
+            m = None if cmd else SWITCH.match(text)
             target = match_project(m.group(1), load_panes()) if m else None
             if target:
                 switch_to(target, "by voice")
                 continue
-            if LIST.match(text) or HELP.match(text):
+            if not cmd and (LIST.match(text) or HELP.match(text)):
                 last_active = time.time()
                 cue(cfg, "accepted", block=True)
-            if LIST.match(text):
+            if not cmd and LIST.match(text):
                 names = [p["project"] for p in load_panes()]
                 log(f"projects: {names}")
                 say_local("Open projects: " + ", ".join(names) + "." if names
                           else "I don't know any projects yet.")
                 continue
-            if HELP.match(text):
+            if not cmd and HELP.match(text):
                 say_local(HELP_TEXT)
                 continue
             # (a "switch to …" that matched no project falls through to Claude)
@@ -778,8 +830,13 @@ def loop(iterm_sid: str, claude_sid: str, cfg: dict, wake: bool = False) -> None
             last_active = time.time()
             cue(cfg, "accepted")
             sent_at = time.time()
-            if not send(iterm_sid, text):
+            if not send(iterm_sid, outgoing):
                 say_local("I can't reach that pane any more. Say switch to, and a project name.")
+                continue
+            if not expect_reply:          # e.g. /clear: Claude doesn't answer, so don't wait
+                log("sent; no spoken reply expected")
+                time.sleep(1.0)
+                cue(cfg, "ready", block=True)
                 continue
             log("sent; mic closed until the reply has been spoken")
             wait_for_reply(cfg, sent_at, claude_sid)

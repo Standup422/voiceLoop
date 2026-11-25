@@ -27,6 +27,10 @@ woken with the text. Arguments: `wake` = only "Claude, …" is accepted (shared 
   first paragraph; only that paragraph is read aloud). Then, **before ending the turn**,
   start step 2 again. (Its recording is discarded while your reply is spoken: the
   half-duplex guard.)
+- `command` (the user said "command <name>" for a name in their allowlist; the name is in
+  `command`): if a skill with that name is available to you (e.g. `wrap-session`), run it,
+  then restart step 2. Built-in commands like `clear` and `compact` can only be typed by the
+  user: say "In the app, please type slash <name> yourself." and restart step 2.
 - `stop` (the user said "stop listening"): say "Stopped listening." Do not restart.
 - `timeout` (20 minutes of silence): say "Nothing for 20 minutes, so I stopped listening." Do
   not restart.

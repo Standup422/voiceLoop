@@ -27,6 +27,8 @@ the transcribed text goes to Claude, exactly as if you'd typed it. (Claude Code'
   session; the voice follows.
 - **Short spoken answers.** When you speak, Claude is asked to open with 1–3 plain sentences;
   only the first paragraph is read aloud, with code, tables and links left out.
+- **Spoken slash commands, safely:** "command compact", "command clear" (asks for a spoken
+  yes first). Only commands on your allowlist run.
 - **Per-project vocabulary** so Whisper spells your project's words right.
 - **Safety:** speech can't become a shell or slash command; nothing is typed into a pane where Claude
   isn't running; the mic turns off after 20 quiet minutes.

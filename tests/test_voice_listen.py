@@ -201,6 +201,57 @@ class Clean(unittest.TestCase):
         self.assertFalse(vl.is_stop("Don't stop listening to the logs yet", CFG))
 
 
+class SpokenCommands(unittest.TestCase):
+    """Deliberate slash commands: trigger word + allowlist (+ spoken yes for /clear)."""
+    ALLOWED = {"clear": {"confirm": True, "reply": False}, "compact": {"reply": False},
+               "wrap-session": {}, "session-digest": {}, "voice-loop": {}}
+
+    def test_trigger_phrases(self):
+        for said, name in [("command clear", "clear"), ("Command, compact.", "compact"),
+                           ("run command wrap session", "wrap-session"),
+                           ("slash session digest", "session-digest"),
+                           ("Please run the command voice loop.", "voice-loop"),
+                           ("command: wrap-session", "wrap-session")]:
+            self.assertEqual((vl.parse_command(said, self.ALLOWED) or [None])[0], name, said)
+
+    def test_only_the_allowlist_runs(self):
+        for said in ["command delete everything", "slash model opus", "the command line is broken",
+                     "clear the screen", "I ran the compact command yesterday", "command"]:
+            self.assertIsNone(vl.parse_command(said, self.ALLOWED), said)
+        self.assertIsNone(vl.parse_command("command clear", {}))
+
+    def test_options_come_along(self):
+        self.assertEqual(vl.parse_command("command clear", self.ALLOWED),
+                         ("clear", {"confirm": True, "reply": False}))
+
+    def test_public_default_is_builtins_only(self):
+        self.assertEqual(sorted(vl.DEFAULTS["commands"]), ["clear", "compact"])
+        self.assertTrue(vl.DEFAULTS["commands"]["clear"]["confirm"])
+
+    def test_wake_word_then_command(self):
+        verdict, text = vl.Gate(True, 30).feed("Hey Claude, command clear.", 0)
+        self.assertEqual(verdict, "send")
+        self.assertEqual(vl.parse_command(text, self.ALLOWED)[0], "clear")
+
+    def _confirm(self, status, answer):
+        saved = vl.log
+        vl.log = lambda *a: None
+        self.addCleanup(setattr, vl, "log", saved)
+        cfg = {**CFG, "confirm_seconds": 1}
+        return vl.confirm_by_voice(cfg, "/nonexistent.wav", rec=lambda c, w, deadline=0: status,
+                                   stt=lambda c, w: answer)
+
+    def test_confirmation(self):
+        self.assertTrue(self._confirm("ok", "Yes."))
+        self.assertTrue(self._confirm("ok", "Yeah, do it."))
+        self.assertTrue(self._confirm("ok", "Claude, yes"))
+        self.assertFalse(self._confirm("ok", "No."))
+        self.assertFalse(self._confirm("ok", "Wait, what?"))
+        self.assertFalse(self._confirm("ok", ""))
+        self.assertFalse(self._confirm("timeout", "yes"))   # silence is never a yes
+        self.assertFalse(self._confirm("spoke", "yes"))
+
+
 class SuggestThreshold(unittest.TestCase):
     """Room calibration (install.sh): RMS levels per 30 ms frame, 0..1."""
 
@@ -310,6 +361,11 @@ class ListenOnce(unittest.TestCase):
 
     def test_mic_failure(self):
         self.assertEqual(self.run_once([("fail", "")])["status"], "fail")
+
+    def test_command_is_reported_not_typed(self):
+        self.cfg["commands"] = {"wrap-session": {}}
+        r = self.run_once([("ok", "command wrap session")])
+        self.assertEqual(r, {"status": "command", "heard": "command wrap session", "command": "wrap-session"})
 
     def test_busy_when_the_iterm_loop_owns_the_mic(self):
         vl.listener_running = lambda: True
