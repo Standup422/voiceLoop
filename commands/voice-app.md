@@ -16,7 +16,8 @@ woken with the text. Arguments: `wake` = only "Claude, …" is accepted (shared 
 **Otherwise:**
 1. Run `voice session on` (so your replies are spoken by the Stop hook).
 2. Start listening as a **background** command (run_in_background), one at a time:
-   `voice listen once --json --timeout 1200` (add `--wake` if the argument was `wake`).
+   `voice listen once --json` (add `--wake` if the argument was `wake`). It gives up after the
+   user's idle time (`idle_minutes`, default 20).
 3. Tell the user in one short line that you're listening, then end your turn.
 
 **When the background command finishes**, read its JSON `{"status", "heard"}`:
@@ -32,8 +33,8 @@ woken with the text. Arguments: `wake` = only "Claude, …" is accepted (shared 
   then restart step 2. Built-in commands like `clear` and `compact` can only be typed by the
   user: say "In the app, please type slash <name> yourself." and restart step 2.
 - `stop` (the user said "stop listening"): say "Stopped listening." Do not restart.
-- `timeout` (20 minutes of silence): say "Nothing for 20 minutes, so I stopped listening." Do
-  not restart.
+- `timeout` (nothing said for the idle time): say "Nothing for a while, so I stopped listening."
+  Do not restart.
 - `busy`: the iTerm conversation loop owns the mic. Say so (`voice listen off` frees it).
 - `fail`: the mic gave nothing. The Claude app needs Microphone permission (System
   Settings, Privacy and Security, Microphone), then a **relaunch** of the app. Until then it

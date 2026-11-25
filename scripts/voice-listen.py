@@ -23,7 +23,7 @@
 #            voice-listen.py --iterm-session <id> --claude-session <id>
 #          App mode (Claude desktop app, Code tab: no iTerm pane to type into; the
 #          session runs this as a background command and IS its own ears):
-#            voice listen once [--wake] [--json] [--timeout 120]
+#            voice listen once [--wake] [--json] [--timeout N]   (default N: idle_minutes)
 #            = voice-listen.py --once …  → prints {"status": "heard"|"stop"|"timeout"|
 #              "busy"|"fail", "heard": "<text>"}. See /voice-app and docs/HOW-IT-WORKS.md.
 #          Word list: voice words [add X | fix heard = Right | remove X] (~/.claude/voice/words.txt)
@@ -915,7 +915,12 @@ def run_setup(cfg: dict) -> int:
     print(f"  Heard: {t or '(nothing)'}")
     say_local(f"I heard: {t}" if t else "I didn't catch that.")
 
-    h("5/6  Settings (Enter keeps the current value)")
+    h("5/6  How listening runs, and its settings")
+    print("  iTerm (voice listen / voice listen wake): runs until you say \"stop listening\". After you\n"
+          "  speak, the mic stays closed while Claude thinks and talks, then reopens by itself (chime).\n"
+          "  Claude app (/voice-app): the session listens for one message at a time and starts\n"
+          "  listening again after each reply. Both stop after the idle time below.\n"
+          "  Enter keeps the current value.")
     for key, kind, text, why in [
             ("silence_seconds", "seconds", "Pause that ends your message (seconds)",
              "How long you can stop talking before what you said is sent. Longer = room to think."),
@@ -1163,7 +1168,8 @@ def main() -> int:
     ap.add_argument("--claude-session", default=os.environ.get("CLAUDE_CODE_SESSION_ID", ""))
     ap.add_argument("--once", action="store_true",
                     help="app mode: wait for ONE usable utterance, print it, exit")
-    ap.add_argument("--timeout", type=float, default=120, help="--once: give up after N seconds")
+    ap.add_argument("--timeout", type=float, default=None,
+                    help="--once: give up after N seconds (default: idle_minutes, like the loop)")
     ap.add_argument("--json", action="store_true", help="--once: print a JSON result")
     ap.add_argument("--wake", action="store_true", help="only accept sentences starting with 'Claude'")
     ap.add_argument("--measure-room", type=float, metavar="SECS", nargs="?", const=2.0,
@@ -1185,7 +1191,8 @@ def main() -> int:
     # would linger and a recording could stay in the temp dir. Make it a normal exit.
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
     if a.once:
-        res = listen_once(cfg, a.timeout, wake=a.wake or bool(cfg["wake"]), cwd=os.getcwd())
+        timeout = a.timeout if a.timeout is not None else float(cfg["idle_minutes"]) * 60
+        res = listen_once(cfg, timeout, wake=a.wake or bool(cfg["wake"]), cwd=os.getcwd())
         print(json.dumps(res) if a.json else f"{res['status']}: {res['heard']}")
         return 1 if res["status"] in ("busy", "fail") else 0
     if not a.iterm_session:

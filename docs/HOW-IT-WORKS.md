@@ -106,7 +106,7 @@ The Claude desktop app has no supported way for an outside program to type into 
 session. So the session listens **for itself**. `/voice-app` makes it run
 
 ```bash
-voice listen once --json --timeout 1200      # (--wake in a shared room)
+voice listen once --json      # (--wake in a shared room); gives up after idle_minutes
 ```
 
 as a **background command** and end its turn. Claude Code wakes the session when a background
