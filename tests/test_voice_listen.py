@@ -285,6 +285,13 @@ class SetupWizard(unittest.TestCase):
         self.assertEqual(vl.Gate(True, 30, extra_wake=("pod",)).feed("Pod, what's next?", 0),
                          ("send", "what's next?"))
 
+    def test_setup_refuses_without_a_keyboard(self):
+        # gallifrey 2026-11-25: piped, it took every default and recorded from the mic
+        r = subprocess.run([sys.executable, str(SCRIPT), "--setup"], stdin=subprocess.DEVNULL,
+                           capture_output=True, text=True, timeout=30)
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("interactive", r.stderr)
+
     def test_parse_setting(self):
         P = vl.parse_setting
         self.assertEqual(P("", 2.5, "seconds"), 2.5)
@@ -319,7 +326,7 @@ class SuggestThreshold(unittest.TestCase):
         levels = [0.0043] * 60 + [0.0050] * 5 + [0.0055] * 2
         r = vl.suggest_threshold(levels)
         self.assertTrue(r["ok"])
-        self.assertEqual(r["threshold"], "0.9%")
+        self.assertEqual(r["threshold"], "1.1%")   # that room's peak later rose to 0.70 %
 
     def test_quiet_headset_keeps_the_default(self):
         r = vl.suggest_threshold([0.0013] * 66)       # RIG WX1 noise floor 0.13 %

@@ -66,7 +66,8 @@ export PATH="$HOME/.local/bin:$PATH"
 ```
 
 **c) Microphone permission.** In System Settings → Privacy & Security → **Microphone**, turn
-it on for **iTerm** and/or **Claude**, then **quit and reopen that app**.
+it on for every app you'll talk through (**iTerm**, **Terminal** and/or **Claude**), then
+**quit and reopen that app**.
 
 > ⚠️ Without this the mic records pure silence and macOS **does not ask**. If voiceLoop never
 > hears you, check this first.
@@ -74,7 +75,9 @@ it on for **iTerm** and/or **Claude**, then **quit and reopen that app**.
 **d) (iTerm only)** The first time voiceLoop types into your Claude session, macOS asks to let it
 control iTerm (Automation). Click **OK**.
 
-**e) Run the setup wizard** in a terminal tab (not inside Claude Code: it needs your keyboard):
+**e) Run the setup wizard** in a terminal window (not inside a Claude session: it needs your
+keyboard). The terminal app needs Microphone permission too. **Using only the Claude app?**
+Open its **Terminal panel** and run it there: it uses the Claude app's permission.
 ```bash
 voice setup
 ```

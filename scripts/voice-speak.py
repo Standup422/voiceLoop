@@ -608,6 +608,12 @@ def cli(args: list) -> int:
         except OSError:
             pass
     elif cmd == "setup":   # interactive wizard; lives in voice-listen.py (it owns the mic code)
+        if any(x in ("-h", "--help", "help") for x in args[1:]):
+            print("voice setup: interactive first-run wizard, about 3 minutes. Run it in a terminal\n"
+                  "window. Steps: mic check + level meter, room noise, wake-word training (say\n"
+                  "\"Claude\" 5 times), a speak-and-hear test, the main settings, a cheat sheet.\n"
+                  "Nothing is saved without a yes; ~/.claude/voice/config.json is backed up first.")
+            return 0
         script = Path(__file__).resolve().parent / "voice-listen.py"
         os.execv(str(script), [str(script), "--setup"])
     elif cmd == "listen":

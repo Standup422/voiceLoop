@@ -88,7 +88,15 @@ link=$HOME/.local/bin/voice
 if [[ -L $link && $(readlink "$link") == "$HOOKS/voice-speak.py" ]]; then pass "voice -> $HOOKS/voice-speak.py"
 elif do_ mkdir -p "$HOME/.local/bin" && do_ ln -sfn "$HOOKS/voice-speak.py" "$link"; then pass "voice (symlink created)"
 else fail "$link missing or wrong"; fi
-[[ ":$PATH:" == *":$HOME/.local/bin:"* ]] || todo+=("Add ~/.local/bin to PATH (e.g. in ~/.zshrc) so \`voice\` is found.")
+# Check the user's LOGIN shell, not ours: run from Claude Code, ~/.local/bin is on our PATH
+# even when no startup file adds it, and `voice` is then missing in a normal terminal.
+login_path=$("${SHELL:-/bin/zsh}" -lic 'print -r -- "VLPATH=$PATH" 2>/dev/null || echo "VLPATH=$PATH"' </dev/null 2>/dev/null | sed -n 's/^VLPATH=//p' | tail -1)
+if [[ ":${login_path:-$PATH}:" == *":$HOME/.local/bin:"* ]]; then pass "~/.local/bin is on your login PATH"
+else
+  echo "        ~/.local/bin is not on your login shell's PATH: \`voice\` won't be found in a new terminal"
+  todo+=("Add ~/.local/bin to your PATH, then open a new terminal window:
+          echo 'export PATH=\"\$HOME/.local/bin:\$PATH\"' >> ~/.zshrc")
+fi
 do_ mkdir -p "$HOME/.claude/commands" 2>/dev/null
 for c in "$HERE"/commands/*.md; do
   n=$(basename "$c"); dst=$HOME/.claude/commands/$n
@@ -209,9 +217,10 @@ if (( ! QUIET )) && (( ! CHECK )); then
   else say "voiceLoop is installed on this Mac." && pass "say spoke"; fi
 fi
 
-todo+=("Microphone permission: the app that runs Claude Code (iTerm and/or the Claude app) needs it
+todo+=("Microphone permission: each app that records needs it (iTerm, Terminal, and/or the Claude app)
         in System Settings > Privacy & Security > Microphone, then a RELAUNCH of that app.
-        Without it the mic records silence and macOS never asks.")
+        Without it the mic records silence and macOS never asks. Claude-app-only? Run \`voice setup\`
+        in the app's Terminal panel: it uses the Claude app's permission.")
 todo+=("iTerm conversation mode also needs Automation permission for iTerm (asked on first send).")
 
 printf '\n\033[1mResult: %d ok, %d need attention\033[0m\n' "$ok" "$bad"

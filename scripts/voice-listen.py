@@ -192,14 +192,15 @@ def _threshold(cfg: dict) -> float:
 
 def suggest_threshold(levels: list) -> dict:
     """Room noise (RMS per 30 ms frame, 0..1) -> a threshold safely above it.
-    Rule: max(0.5 %, 2 x median, 1.5 x the 95th percentile), rounded UP to 0.1 %.
-    A quiet laptop mic (median 0.43 %, max 0.55 %) gets 0.9 %; under the 0.5 %
-    default its recordings never ended. All zeros = no signal (permission?)."""
+    Rule: max(0.5 %, 2.5 x median, 2 x the 95th percentile), rounded UP to 0.1 %.
+    A quiet laptop mic (median 0.43 %, max 0.55 %) gets 1.1 %; under the 0.5 %
+    default its recordings never ended, and that room's peak rose to 0.70 % within
+    10 minutes, so the margin is generous (speech is typically 2-10 %). All zeros = no signal (permission?)."""
     if not levels or max(levels) == 0:
         return {"ok": False, "why": "no signal: the mic gave digital silence (Microphone permission?)"}
     v = sorted(levels)
     med, p95 = v[len(v) // 2], v[min(len(v) - 1, int(len(v) * 0.95))]
-    pct = max(0.5, 2 * med * 100, 1.5 * p95 * 100)
+    pct = max(0.5, 2.5 * med * 100, 2 * p95 * 100)
     pct = math.ceil(round(pct * 10, 6)) / 10
     return {"ok": True, "median": round(med * 100, 3), "p95": round(p95 * 100, 3),
             "max": round(v[-1] * 100, 3), "threshold": f"{pct:g}%"}
@@ -883,11 +884,16 @@ def run_setup(cfg: dict) -> int:
     say_local(f"I heard: {t}" if t else "I didn't catch that.")
 
     h("5/6  Settings (Enter keeps the current value)")
-    for key, kind, text in [
-            ("silence_seconds", "seconds", "Quiet time that ends your message and sends it"),
-            ("follow_up_seconds", "seconds", "After a reply, answer without saying the name for"),
-            ("idle_minutes", "minutes", "Turn the mic off after this long with nothing sent"),
-            ("wake", "yesno", "Always require the wake word (also for `voice listen`)")]:
+    for key, kind, text, why in [
+            ("silence_seconds", "seconds", "Pause that ends your message (seconds)",
+             "How long you can stop talking before what you said is sent. Longer = room to think."),
+            ("follow_up_seconds", "seconds", "No-name window after a reply (seconds)",
+             "After Claude answers, you can reply without saying \"Claude\" for this long."),
+            ("idle_minutes", "minutes", "Mic turns off after (minutes)",
+             "With nothing sent for this long, listening stops by itself."),
+            ("wake", "yesno", "Always require the wake word (y/n)",
+             "y = even `voice listen` only takes sentences starting with \"Claude\".")]:
+        print(f"  {why}")
         while True:
             cur = cfg[key]
             shown = ("y" if cur else "n") if kind == "yesno" else cur
@@ -1089,6 +1095,11 @@ def main() -> int:
     ap.add_argument("--setup", action="store_true", help="interactive setup wizard (voice setup)")
     a = ap.parse_args()
     if a.setup:
+        if not (sys.stdin.isatty() and sys.stdout.isatty()):
+            print("voice setup is interactive: run it in a terminal window (iTerm, Terminal, or the\n"
+                  "Claude app's Terminal panel), not through a pipe or from inside a Claude session.",
+                  file=sys.stderr)
+            return 2
         return run_setup(load_config())
     if a.measure_room is not None:
         print(json.dumps(measure_room(a.measure_room)))
