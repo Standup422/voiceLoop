@@ -1,0 +1,16 @@
+{
+  "session_id": "00000000-0000-0000-0000-000000000000",
+  "transcript_path": "/Users/example/.claude/projects/-Users-example-Projects-voiceLoop/00000000-0000-0000-0000-000000000000.jsonl",
+  "cwd": "/Users/example/Projects/voiceLoop",
+  "scratchpad_dir": "/private/tmp/claude-501/example/scratchpad",
+  "prompt_id": "11111111-1111-1111-1111-111111111111",
+  "permission_mode": "auto",
+  "effort": {
+    "level": "medium"
+  },
+  "hook_event_name": "Stop",
+  "stop_hook_active": false,
+  "last_assistant_message": "It worked. The swap went through:\n\n- `settings.json` is valid\n- see `tools/capture-stop.sh:12`\n\n```bash\njq -e . ~/.claude/settings.json\n```\n\n| Check | Result |\n|---|---|\n| backup | ok |\n\nDocs: https://code.claude.com/docs/en/hooks",
+  "background_tasks": [],
+  "session_crons": []
+}

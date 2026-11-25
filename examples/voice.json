@@ -1,0 +1,8 @@
+{
+  "vocabulary": ["Postgres", "Kubernetes", "useEffect", "pytest", "Acme"],
+  "replacements": {
+    "post gress": "Postgres",
+    "cube control": "kubectl",
+    "use effect": "useEffect"
+  }
+}
