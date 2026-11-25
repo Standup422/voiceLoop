@@ -13,6 +13,7 @@
 #          CLI:    voice on | off | session [on|off] | stop | status | test [text]
 #                  voice listen [on|wake|off|status|switch <project>|once [--wake --json]]
 #                  voice setup   (interactive first-run wizard: mic, wake word, settings)
+#                  voice words [add X | fix heard = Right | remove X]   (Whisper word list)
 #          Debug:  voice-speak.py --dry-run < payload.json   # print cleaned text only
 # Deps:    stdlib only; macOS `say`. Optional ~/.claude/voice/config.json:
 #          {"engine":"say"|"kokoro","voice":"Samantha","kokoro_voice":"bf_emma","rate":200,...}
@@ -411,7 +412,9 @@ USAGE = """usage: voice on | off | session [on|off] | stop | status | test [text
   listen wake   same, but only sentences starting "Claude, …" are sent
   listen off    end conversation mode       listen status   show it + recent log
   listen switch <project>   retarget the running listener
-  status --json machine-readable state for dashboards (no transcript text)"""
+  status --json machine-readable state for dashboards (no transcript text)
+  words [add X | fix heard = Right | remove X]   the word list Whisper should spell right
+  setup         interactive first-run wizard (run it in a terminal window)"""
 
 
 def listener_pid() -> int:
@@ -607,6 +610,9 @@ def cli(args: list) -> int:
             print(f"last:    {last_file().read_text()[:120]!r}")
         except OSError:
             pass
+    elif cmd == "words":   # word list for Whisper; lives in voice-listen.py (it reads it)
+        script = Path(__file__).resolve().parent / "voice-listen.py"
+        os.execv(str(script), [str(script), "--words", *args[1:]])
     elif cmd == "setup":   # interactive wizard; lives in voice-listen.py (it owns the mic code)
         if any(x in ("-h", "--help", "help") for x in args[1:]):
             print("voice setup: interactive first-run wizard, about 3 minutes. Run it in a terminal\n"

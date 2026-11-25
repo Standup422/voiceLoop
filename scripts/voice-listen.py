@@ -26,6 +26,7 @@
 #            voice listen once [--wake] [--json] [--timeout 120]
 #            = voice-listen.py --once …  → prints {"status": "heard"|"stop"|"timeout"|
 #              "busy"|"fail", "heard": "<text>"}. See /voice-app and docs/HOW-IT-WORKS.md.
+#          Word list: voice words [add X | fix heard = Right | remove X] (~/.claude/voice/words.txt)
 #          Setup wizard: voice setup (= voice-listen.py --setup): mic, room, wake-word
 #            training, speak-and-hear test, settings, cheat sheet.
 #          Room check (used by install.sh): voice-listen.py --measure-room [2]
@@ -319,19 +320,47 @@ def project_vocab(cwd: str) -> dict:
     return out
 
 
+WORDS = lambda: voice_dir() / "words.txt"   # noqa: E731  your own word list (`voice words`)
+
+
+def parse_words(text: str) -> dict:
+    """words.txt: one word or phrase per line; "heard = Right" also fixes a spelling;
+    "#" starts a comment. The right-hand side goes into the vocabulary hint too."""
+    out = {"vocabulary": [], "replacements": {}}
+    for line in text.splitlines():
+        line = line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        if "=" in line:
+            wrong, right = (x.strip() for x in line.split("=", 1))
+            if wrong and right:
+                out["replacements"][wrong.lower()] = right[:60]
+                out["vocabulary"].append(right[:60])
+        else:
+            out["vocabulary"].append(line[:60])
+    return out
+
+
+def load_words() -> dict:
+    try:
+        return parse_words(WORDS().read_text())
+    except OSError:
+        return {"vocabulary": [], "replacements": {}}
+
+
 def effective(cfg: dict, cwd: str) -> dict:
-    """Global settings + the target project's vocabulary. Project terms go FIRST in
-    the prompt (they matter most, and the prompt has a size cap); project
-    replacements win over global ones."""
-    pv = project_vocab(cwd)
+    """Global settings + your word list + the target project's vocabulary. Order in the
+    prompt (it has a size cap): project terms, then words.txt, then the config "prompt".
+    Replacements: config < words.txt < project (the most specific wins)."""
+    pv, wl = project_vocab(cwd), load_words()
     e = dict(cfg)
     terms, seen = [], set()
-    for t in pv["vocabulary"] + [x.strip() for x in str(cfg["prompt"]).split(",")]:
+    for t in pv["vocabulary"] + wl["vocabulary"] + [x.strip() for x in str(cfg["prompt"]).split(",")]:
         if t and t.lower() not in seen and len(", ".join(terms + [t])) <= PROMPT_MAX:
             terms.append(t)
             seen.add(t.lower())
     e["prompt"] = ", ".join(terms)
-    e["replacements"] = {**(cfg.get("replacements") or {}), **pv["replacements"]}
+    e["replacements"] = {**(cfg.get("replacements") or {}), **wl["replacements"], **pv["replacements"]}
     return e
 
 
@@ -1081,7 +1110,51 @@ def loop(iterm_sid: str, claude_sid: str, cfg: dict, wake: bool = False) -> None
             cue(cfg, "ready", block=True)
 
 
+def words_cli(args: list) -> int:
+    """voice words [list] | add <word or phrase> | fix <heard> = <Right> | remove <word>"""
+    path, sub = WORDS(), (args[0] if args else "list")
+    rest = " ".join(args[1:]).strip()
+    lines = path.read_text().splitlines() if path.exists() else [
+        "# voiceLoop word list: names and terms Whisper should spell right.",
+        "# One per line. \"heard = Right\" also fixes a spelling. Edit freely, or: voice words add …"]
+    key = lambda l: l.split("#", 1)[0].split("=", 1)[0].strip().lower()   # noqa: E731
+    if sub == "add" and rest:
+        new = [w.strip() for w in rest.split(",") if w.strip()]
+        have = {key(l) for l in lines}
+        added = [w for w in new if w.lower() not in have]
+        lines += added
+        print(f"added: {', '.join(added) or 'nothing new'}")
+    elif sub == "fix" and "=" in rest:
+        wrong, right = (x.strip() for x in rest.split("=", 1))
+        lines = [l for l in lines if key(l) != wrong.lower()] + [f"{wrong} = {right}"]
+        print(f"fix: {wrong!r} -> {right!r}")
+    elif sub == "remove" and rest:
+        before = len(lines)
+        lines = [l for l in lines if key(l) != rest.lower() and l.split("=", 1)[-1].strip().lower() != rest.lower()
+                 or l.lstrip().startswith("#")]
+        print(f"removed {before - len(lines)} line(s)")
+    elif sub != "list":
+        print("usage: voice words [list] | add <word>[, <word>…] | fix <heard> = <Right> | remove <word>",
+              file=sys.stderr)
+        return 2
+    if sub != "list":
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("\n".join(lines) + "\n")
+    w = load_words()
+    print(f"{path}: {len(w['vocabulary'])} word(s), {len(w['replacements'])} fix(es)")
+    for t in w["vocabulary"]:
+        print(f"  {t}")
+    for a, b in w["replacements"].items():
+        print(f"  {a} -> {b}")
+    used = len(effective(load_config(), "")["prompt"])
+    print(f"vocabulary hint: {used} of {PROMPT_MAX} characters" +
+          ("  (full: later words are dropped; keep the list focused)" if used > PROMPT_MAX - 40 else ""))
+    return 0
+
+
 def main() -> int:
+    if sys.argv[1:2] == ["--words"]:
+        return words_cli(sys.argv[2:])
     ap = argparse.ArgumentParser(description="voiceLoop conversation mode")
     ap.add_argument("--iterm-session", default=os.environ.get("ITERM_SESSION_ID", ""))
     ap.add_argument("--claude-session", default=os.environ.get("CLAUDE_CODE_SESSION_ID", ""))

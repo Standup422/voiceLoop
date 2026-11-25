@@ -13,6 +13,7 @@ import subprocess
 import tempfile
 import time
 import unittest
+import unittest.mock
 from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parent.parent
@@ -24,6 +25,8 @@ SCRIPT = Path(os.environ.get("VOICE_LISTEN") or   # a developer's canonical copy
 spec = importlib.util.spec_from_file_location("voice_listen", SCRIPT)
 vl = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(vl)
+# Never read the tester's own config.json / words.txt: same results on every Mac.
+os.environ["CLAUDE_VOICE_DIR"] = tempfile.mkdtemp(prefix="voiceloop-test-")
 CFG = dict(vl.DEFAULTS)   # never the tester's own config.json: same results on every Mac
 HAVE_AUDIO = all(shutil.which(x) for x in ("say", "sox", "whisper-cli")) and Path(CFG["model"]).exists()
 
@@ -316,6 +319,50 @@ class SetupWizard(unittest.TestCase):
         self.assertEqual(cfg["engine"], "kokoro")                      # untouched
         self.assertEqual(cfg["listen"], {"threshold": "0.5%", "wake_words": ["pod"], "silence_seconds": 2})
         self.assertIn('"0.5%"', b.read_text())                         # backup = the old file
+
+
+class WordList(unittest.TestCase):
+    """~/.claude/voice/words.txt + `voice words`."""
+
+    def setUp(self):
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        self.dir = Path(d.name)
+        saved = vl.voice_dir
+        self.addCleanup(setattr, vl, "voice_dir", saved)
+        vl.voice_dir = lambda: self.dir
+
+    def test_parse(self):
+        w = vl.parse_words("# comment\nZephyrine\n\ncube control = kubectl  # fix\n  billbook  \n")
+        self.assertEqual(w["vocabulary"], ["Zephyrine", "kubectl", "billbook"])
+        self.assertEqual(w["replacements"], {"cube control": "kubectl"})
+
+    def test_merge_order_and_precedence(self):
+        (self.dir / "words.txt").write_text("Zephyrine\npost gress = Postgres\n")
+        cwd = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, cwd)
+        (Path(cwd) / ".claude").mkdir()
+        (Path(cwd) / ".claude" / "voice.json").write_text(json.dumps(
+            {"vocabulary": ["Acme"], "replacements": {"post gress": "POSTGRES"}}))
+        e = vl.effective({**CFG, "prompt": "Claude", "replacements": {"post gress": "pg"}}, cwd)
+        self.assertEqual(e["prompt"], "Acme, Zephyrine, Postgres, Claude")       # project, list, config
+        self.assertEqual(e["replacements"]["post gress"], "POSTGRES")             # project wins
+        e = vl.effective({**CFG, "prompt": "Claude", "replacements": {"post gress": "pg"}}, "")
+        self.assertEqual(e["replacements"]["post gress"], "Postgres")             # list beats config
+
+    def test_cli_add_fix_remove(self):
+        out = io.StringIO()
+        with unittest.mock.patch("sys.stdout", out):
+            self.assertEqual(vl.words_cli(["add", "Zephyrine,", "billbook"]), 0)
+            vl.words_cli(["add", "zephyrine"])                                   # no duplicate
+            vl.words_cli(["fix", "cube", "control", "=", "kubectl"])
+            vl.words_cli(["remove", "billbook"])
+        w = vl.load_words()
+        self.assertEqual(w["vocabulary"], ["Zephyrine", "kubectl"])
+        self.assertEqual(w["replacements"], {"cube control": "kubectl"})
+        self.assertTrue((self.dir / "words.txt").read_text().startswith("# voiceLoop word list"))
+        with unittest.mock.patch("sys.stderr", io.StringIO()):
+            self.assertEqual(vl.words_cli(["bogus"]), 2)
 
 
 class SuggestThreshold(unittest.TestCase):

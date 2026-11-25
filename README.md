@@ -29,7 +29,8 @@ the transcribed text goes to Claude, exactly as if you'd typed it. (Claude Code'
   only the first paragraph is read aloud, with code, tables and links left out.
 - **Spoken slash commands, safely:** "command compact", "command clear" (asks for a spoken
   yes first). Only commands on your allowlist run.
-- **Per-project vocabulary** so Whisper spells your project's words right.
+- **A word list** (`voice words add …`) plus per-project vocabulary, so Whisper spells your names
+  and terms right.
 - **Safety:** speech can't become a shell or slash command; nothing is typed into a pane where Claude
   isn't running; the mic turns off after 20 quiet minutes.
 - **One-command, self-testing install** that measures your room's noise to set the mic sensitivity.
@@ -72,7 +73,7 @@ the neural voice uses `kokoro-onnx`.
   and speaks it in the background; a `UserPromptSubmit` hook asks for a short spoken opening and
   stops any speech when you type. It's also the `voice` command.
 - **`voice-listen.py`**, the ears. It records with its own endpointing, transcribes with
-  whisper.cpp + Silero VAD (about 0.35 s), and types into the iTerm pane by session id, or, in the
+  whisper.cpp + Silero VAD (0.3–0.5 s), and types into the iTerm pane by session id, or, in the
   desktop app, hands the text back to the session that is listening for itself.
 - **`voice-kokoro.py`** speaks sentence by sentence, so the first words come about 1 s after
   Claude finishes.
@@ -97,7 +98,7 @@ aren't installed.
 
 ## Credits
 
-[whisper.cpp](https://github.com/ggml-org/whisper.cpp) (MIT) with OpenAI's Whisper `base.en`
+[whisper.cpp](https://github.com/ggml-org/whisper.cpp) (MIT) with OpenAI's Whisper `base.en` / `small.en`
 model (MIT) · [Silero VAD](https://github.com/snakers4/silero-vad) (MIT) ·
 [Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M) (Apache-2.0) via
 [kokoro-onnx](https://github.com/thewh1teagle/kokoro-onnx) (MIT) ·

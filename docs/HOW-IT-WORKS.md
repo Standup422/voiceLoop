@@ -46,7 +46,9 @@ record ─► transcribe ─► clean + decide ─► type into the pane ─► 
 - **Recording:** its own endpointing on 30 ms frames. A recording starts when the loudness passes the
   `threshold`, keeps 0.5 s of *pre-roll* (so soft first syllables aren't clipped), and ends after
   `silence_seconds` (2.5) of quiet. The installer measures your room to pick the threshold.
-- **Transcription:** `whisper-cli` with the `base.en` model and **Silero VAD**. The VAD drops
+- **Transcription:** `whisper-cli` with the `base.en` model (about 0.3 s per sentence on Apple
+  silicon) or, with `./install.sh --whisper=small`, `small.en` (about 0.5 s, more accurate,
+  punctuates better), plus **Silero VAD**. The VAD drops
   non-speech, which stops Whisper inventing words from silence. A stop list catches the classic
   inventions ("thanks for watching").
 - **Half-duplex:** the mic is closed while Claude thinks and speaks. A recording is also thrown
@@ -154,6 +156,19 @@ are only here for explanation: the real file is plain JSON.)
 Sounds are macOS system sound names or paths to audio files. The installer sets `ready` and
 `listening` to the two tones in `assets/sounds/`, plays `listening` at 0.6, and sets the
 `threshold` from a 2-second measurement of your room.
+
+**Your word list:** `~/.claude/voice/words.txt` holds the names and terms Whisper should
+spell right, one per line. `heard = Right` also fixes a spelling. Manage it with:
+
+```bash
+voice words                          # show it, and how much of the hint it uses
+voice words add Zephyrine, billbook  # add words (comma-separated)
+voice words fix cube control = kubectl
+voice words remove billbook
+```
+
+It's re-read on every sentence. Whisper's vocabulary hint holds about 600 characters: project
+words first, then your list, then the config's `prompt`. `voice words` warns when it's full.
 
 **Per-project vocabulary:** put a `.claude/voice.json` in a project (see
 [`examples/voice.json`](../examples/voice.json)). When the listener targets that project, its

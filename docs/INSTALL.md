@@ -46,7 +46,8 @@ It runs `brew install` for missing tools without asking (use `--check` first to 
 missing). Kokoro's first use also has `uv` download its Python packages (pinned versions) from
 PyPI, and Python 3.13 if you don't have it.
 
-Options: `--no-kokoro` (skip the 350 MB neural voice and use the built-in macOS voice),
+Options: `--whisper=small` (also get the 466 MB `small.en` speech model: more accurate, about
+0.2 s slower per sentence), `--no-kokoro` (skip the 350 MB neural voice and use the built-in macOS voice),
 `--check` (test only, change nothing), `--help`.
 
 ## 4. The steps the installer leaves to you
@@ -117,6 +118,7 @@ In a Claude Code session:
 - "**command** *name*" runs an allowed slash command: "command compact", or "command clear",
   which asks you to say yes first. Add your own skills to `"commands"` in the config.
 - "**stop listening**" turns the mic off.
+- Names it keeps getting wrong? `voice words add Zephyrine`, or `voice words fix cube control = kubectl`.
 
 ### Good to know
 - **Sounds:** a soft **pluck** means it's listening, a **purr** means your message was sent, and a

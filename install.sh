@@ -10,6 +10,8 @@
 #          ./install.sh --no-kokoro                            # skip the 350 MB neural voice (use `say`)
 #          ./install.sh --quiet                                # no test sound
 #          ./install.sh --no-measure                           # skip the 2 s room-noise check
+#          ./install.sh --whisper=small                        # + the 466 MB small.en model: more
+#                                                                accurate, a bit slower (base is default)
 # Deps:    macOS, Homebrew. Scripts come from this repo's scripts/. Developers who keep the
 #          canonical copies elsewhere point $VOICELOOP_SRC (or an untracked .dev-source file)
 #          at that folder; then it installs from there and warns if scripts/ has drifted.
@@ -27,9 +29,10 @@ HOOKS=$HOME/.claude/hooks
 SHARE=$HOME/.local/share/voiceloop
 MIRROR=${VOICELOOP_MIRROR:-/nonexistent}
 SETTINGS=$HOME/.claude/settings.json
-CHECK=0; KOKORO=1; QUIET=0; MEASURE=1
+CHECK=0; KOKORO=1; QUIET=0; MEASURE=1; WHISPER=base
 for a in "$@"; do case $a in
   --check) CHECK=1 ;; --no-kokoro) KOKORO=0 ;; --quiet) QUIET=1 ;; --no-measure) MEASURE=0 ;;
+  --whisper=*) WHISPER=${a#*=} ;;
   -h|--help) sed -n "2,/^set -uo/{/^set -uo/d;p;}" "$0"; exit 0 ;;
   *) echo "unknown option: $a" >&2; exit 2 ;; esac; done
 
@@ -44,6 +47,7 @@ MODELS=(
   "whisper base.en|models/ggml-base.en.bin|a03779c86df3323075f5e796cb2ce5029f00ec8869eee3fdfb897afe36c6d002|https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin"
   "Silero VAD|models/ggml-silero-v5.1.2.bin|29940d98d42b91fbd05ce489f3ecf7c72f0a42f027e4875919a28fb4c04ea2cf|https://huggingface.co/ggml-org/whisper-vad/resolve/main/ggml-silero-v5.1.2.bin"
 )
+SMALL="whisper small.en|models/ggml-small.en.bin|c6138d6d58ecc8322097e0f987c32f1be8bb0a18532a3f88f734d1bbf9c41e5d|https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.en.bin"
 KMODELS=(
   "Kokoro model|kokoro/kokoro-v1.0.onnx|7d5df8ecf7d4b1878015a32686053fd0eebe2bc377234608764cc0ef3636a6c5|https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/kokoro-v1.0.onnx"
   "Kokoro voices|kokoro/voices-v1.0.bin|bca610b8308e8d99f32e6fe4197e7ec01679264efed0cac9140fe9c29f1fbf7d|https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin"
@@ -111,7 +115,8 @@ fetch() {   # $1 rel path, $2 url -> $SHARE/$1.part
   if [[ -f "$MIRROR/$1" ]]; then echo "        from $MIRROR…"; cp "$MIRROR/$1" "$out"
   else echo "        downloading $(basename "$1")…"; curl -fL --progress-bar -o "$out" "$2"; fi
 }
-want=("${MODELS[@]}"); (( KOKORO )) && want+=("${KMODELS[@]}")
+[[ $WHISPER == base || $WHISPER == small ]] || { echo "--whisper must be base or small" >&2; exit 2; }
+want=("${MODELS[@]}"); (( KOKORO )) && want+=("${KMODELS[@]}"); [[ $WHISPER == small ]] && want+=("$SMALL")
 for m in "${want[@]}"; do
   IFS='|' read -r name rel sha url <<<"$m"; f=$SHARE/$rel
   have=$( [[ -f $f ]] && shasum -a 256 "$f" | awk '{print $1}')
@@ -149,6 +154,11 @@ cfg=$HOME/.claude/voice/config.json
 if [[ -f $cfg ]]; then
   jq -e . "$cfg" >/dev/null 2>&1 && pass "config.json exists and is valid (left as is)" || fail "config.json is not valid JSON"
   cur=$(jq -r '.listen.threshold // "0.5%"' "$cfg" 2>/dev/null)
+  curm=$(jq -r '.listen.model // ""' "$cfg" 2>/dev/null)
+  if [[ $WHISPER == small && $curm != *small* ]]; then
+    todo+=("To use the small model, set it in your existing config:
+          jq '.listen.model = \"$SHARE/models/ggml-small.en.bin\"' $cfg > $cfg.new && mv $cfg.new $cfg")
+  fi
   if [[ -n ${room:-} ]] && awk -v a="${thr%\%}" -v b="${cur%\%}" 'BEGIN{exit !(a > b)}'; then
     todo+=("Your threshold ($cur) is below what this room needs ($thr): recordings may never end. Set it with:
           jq '.listen.threshold = \"$thr\"' $cfg > $cfg.new && mv $cfg.new $cfg")
@@ -157,10 +167,11 @@ elif (( CHECK )); then pass "no config.json (defaults: say + the system voice)"
 else
   mkdir -p "$(dirname "$cfg")"
   engine=$( (( KOKORO )) && echo kokoro || echo say )
-  jq -n --arg e "$engine" --arg s "$SHARE/sounds" --arg t "$thr" '{
+  model=$SHARE/models/ggml-$WHISPER.en.bin
+  jq -n --arg e "$engine" --arg s "$SHARE/sounds" --arg t "$thr" --arg m "$model" '{
     engine: $e, kokoro_voice: "bf_emma", voice: "Samantha", rate: 200,
     mode: "first_paragraph", max_chars: 600,
-    listen: { threshold: $t,
+    listen: { threshold: $t, model: $m,
       sounds: { accepted: "Purr", ready: ($s + "/soft-chime.wav"), stopped: "Basso",
                 listening: ($s + "/pluck-one.wav") },
       sound_volume: 0.3, sound_volumes: { listening: 0.6 } } }' > "$cfg" && pass "config.json written (engine $engine, $( (( KOKORO )) && echo Emma || echo Samantha))"
