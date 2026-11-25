@@ -534,6 +534,13 @@ def status_snapshot() -> dict:
     except (OSError, ValueError, AttributeError):
         hooks = {}
     engine = cfg.get("engine", "say")
+    try:   # spoken slash commands (names only): the listener's allowlist, same default as there
+        listen = json.loads((voice_dir() / "config.json").read_text()).get("listen", {})
+    except (OSError, ValueError, AttributeError):
+        listen = {}
+    allowed = listen.get("commands") if isinstance(listen.get("commands"), dict) else \
+        {"clear": {"confirm": True}, "compact": {}}
+    commands = [{"name": str(k), "confirm": bool((v or {}).get("confirm"))} for k, v in allowed.items()]
     return {
         "speaking": {"global": (voice_dir() / "enabled").exists(), "sessions": sessions,
                      "engine": engine,
@@ -543,6 +550,7 @@ def status_snapshot() -> dict:
         "listening": {"on": bool(lpid), "mode": mode, "target": target, "last": last or None},
         "projects": sorted({p.get("project") for p in panes.values() if p.get("project")}),
         "hooks": hooks,
+        "commands": commands,
     }
 
 
