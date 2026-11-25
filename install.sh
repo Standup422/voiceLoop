@@ -216,5 +216,6 @@ todo+=("iTerm conversation mode also needs Automation permission for iTerm (aske
 
 printf '\n\033[1mResult: %d ok, %d need attention\033[0m\n' "$ok" "$bad"
 printf '\nStill for you:\n'; for t in "${todo[@]}"; do printf '  - %s\n' "$t"; done
-printf '\nThen: in iTerm, `voice session` + `voice listen wake`; in the Claude app, /voice-app.\n'
+printf '\nNext: run `voice setup` in a terminal tab (mic check, wake-word training, settings).\n'
+printf 'Then: in iTerm, `voice session` + `voice listen wake`; in the Claude app, /voice-app.\n'
 (( bad == 0 ))

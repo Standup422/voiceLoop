@@ -62,6 +62,14 @@ class Clean(unittest.TestCase):
         for t in ["What mic are we using?", "Yes.", "Check the logs and the config."]:
             self.assertFalse(vl.is_incomplete(t), t)
 
+    def test_real_sentence_ends_are_not_pauses(self):
+        # 2026-11-25 15:51: "…Can we work on that?" was held as unfinished and never sent
+        for t in ["I would like that wizard first. Can we work on that?", "Yes, do that.",
+                  "I like that.", "Is it and?", "Do it now!", "Should we fix the one for?"]:
+            self.assertFalse(vl.is_incomplete(t), t)
+        for t in ["I think that", "Check the logs and.", "Move it to", "Because of the"]:
+            self.assertTrue(vl.is_incomplete(t), t)
+
     def test_switch_command_parsing(self):
         for said, want in [("Switch to voice loop.", "voice loop"),
                            ("Okay, switch over to the Acme CRM project", "Acme CRM"),
@@ -250,6 +258,57 @@ class SpokenCommands(unittest.TestCase):
         self.assertFalse(self._confirm("ok", ""))
         self.assertFalse(self._confirm("timeout", "yes"))   # silence is never a yes
         self.assertFalse(self._confirm("spoke", "yes"))
+
+
+class SetupWizard(unittest.TestCase):
+    """voice setup: wake-word training + settings input (the parts without a mic)."""
+
+    def test_learns_this_macs_spellings(self):
+        heard = ["Bot.", "Claude.", "Pod.", "Bot.", "Vlog,"]      # real mishearings of a lone "Claude"
+        self.assertEqual(vl.wake_variants(heard), ["bot", "pod", "vlog"])   # most frequent first
+
+    def test_never_learns_everyday_words_or_sentences(self):
+        self.assertEqual(vl.wake_variants(["Yes.", "Okay.", "", "Thank you.", "Hello?",
+                                           "Pass the salt.", "Cloud.", "Claude?"]), [])
+
+    def test_learned_words_wake_only_when_punctuated(self):
+        extra = ("bot", "pod")
+        self.assertEqual(vl.strip_wake("Pod, run the tests.", extra), ("run the tests.", True))
+        self.assertEqual(vl.strip_wake("Bot.", extra), ("", True))
+        self.assertEqual(vl.strip_wake("Hey pod, hello", extra), ("hello", True))
+        self.assertFalse(vl.strip_wake("Pod racing is fun.", extra)[1])
+        self.assertFalse(vl.strip_wake("Pod, run the tests.")[1])        # not learned: no wake
+
+    def test_gate_uses_learned_words(self):
+        g = vl.Gate(True, 30, extra_wake=("pod",))
+        self.assertEqual(g.feed("Pod.", 0), ("yes", ""))
+        self.assertEqual(vl.Gate(True, 30, extra_wake=("pod",)).feed("Pod, what's next?", 0),
+                         ("send", "what's next?"))
+
+    def test_parse_setting(self):
+        P = vl.parse_setting
+        self.assertEqual(P("", 2.5, "seconds"), 2.5)
+        self.assertEqual(P("3", 2.5, "seconds"), 3)
+        self.assertEqual(P("1.5", 2.5, "seconds"), 1.5)
+        self.assertEqual(P("y", False, "yesno"), True)
+        self.assertEqual(P("no", True, "yesno"), False)
+        self.assertEqual(P("0.9", "0.5%", "percent"), "0.9%")
+        for bad, kind in [("0.1", "seconds"), ("abc", "minutes"), ("maybe", "yesno"), ("50", "percent")]:
+            with self.assertRaises(ValueError, msg=bad):
+                P(bad, 1, kind)
+
+    def test_save_listen_merges_and_backs_up(self):
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        saved = vl.voice_dir
+        self.addCleanup(setattr, vl, "voice_dir", saved)
+        vl.voice_dir = lambda: Path(d.name)
+        (Path(d.name) / "config.json").write_text(json.dumps({"engine": "kokoro", "listen": {"threshold": "0.5%"}}))
+        b = vl.save_listen({"wake_words": ["pod"], "silence_seconds": 2})
+        cfg = json.loads((Path(d.name) / "config.json").read_text())
+        self.assertEqual(cfg["engine"], "kokoro")                      # untouched
+        self.assertEqual(cfg["listen"], {"threshold": "0.5%", "wake_words": ["pod"], "silence_seconds": 2})
+        self.assertIn('"0.5%"', b.read_text())                         # backup = the old file
 
 
 class SuggestThreshold(unittest.TestCase):

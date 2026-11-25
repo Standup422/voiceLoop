@@ -74,6 +74,21 @@ it on for **iTerm** and/or **Claude**, then **quit and reopen that app**.
 **d) (iTerm only)** The first time voiceLoop types into your Claude session, macOS asks to let it
 control iTerm (Automation). Click **OK**.
 
+**e) Run the setup wizard** in a terminal tab (not inside Claude Code: it needs your keyboard):
+```bash
+voice setup
+```
+About 3 minutes:
+1. A mic check with a live level meter.
+2. A room-noise measurement.
+3. **Wake-word training:** you say "Claude" five times, and it learns how Whisper hears *your*
+   voice ("Cloud", "Bot", …).
+4. A speak-and-hear test.
+5. The main settings, each explained.
+6. A cheat sheet.
+
+Nothing is saved without a yes, and your config is backed up first.
+
 Check that everything's green:
 ```bash
 cd ~/Projects/voiceLoop && ./install.sh --check

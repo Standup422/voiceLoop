@@ -12,6 +12,7 @@
 # Usage:   Hook:   registered under hooks.Stop in ~/.claude/settings.json (stdin = payload)
 #          CLI:    voice on | off | session [on|off] | stop | status | test [text]
 #                  voice listen [on|wake|off|status|switch <project>|once [--wake --json]]
+#                  voice setup   (interactive first-run wizard: mic, wake word, settings)
 #          Debug:  voice-speak.py --dry-run < payload.json   # print cleaned text only
 # Deps:    stdlib only; macOS `say`. Optional ~/.claude/voice/config.json:
 #          {"engine":"say"|"kokoro","voice":"Samantha","kokoro_voice":"bf_emma","rate":200,...}
@@ -606,6 +607,9 @@ def cli(args: list) -> int:
             print(f"last:    {last_file().read_text()[:120]!r}")
         except OSError:
             pass
+    elif cmd == "setup":   # interactive wizard; lives in voice-listen.py (it owns the mic code)
+        script = Path(__file__).resolve().parent / "voice-listen.py"
+        os.execv(str(script), [str(script), "--setup"])
     elif cmd == "listen":
         return listen_cli(args[1] if len(args) > 1 else "on", args[2:])
     elif cmd == "test":

@@ -65,6 +65,11 @@ follows it, since "cloud" is a real word). For `follow_up_seconds` (30) after an
 no name is needed. Saying just "Claude?" gets a "Yes?". All of this lives in one pure class
 (`Gate`) with unit tests.
 
+Whisper hears a lone "Claude" differently for different voices and mics ("Cloud", "Bot", "Pod").
+`voice setup` has you say it five times and offers to accept the spellings it heard as
+`wake_words` **on that Mac**. Like "Cloud", they count only at the start of a sentence and
+followed by punctuation, so "Pod racing is fun" stays an ordinary sentence.
+
 ### Local commands (never sent to Claude)
 
 "switch to *project*", "which projects", "voice help", "stop listening".
@@ -131,6 +136,7 @@ are only here for explanation: the real file is plain JSON.)
     "silence_seconds": 2.5,   // quiet this long = you're done
     "wake": false,            // true = always use the wake word
     "follow_up_seconds": 30,
+    "wake_words": [],         // extra spellings of "Claude", learned by `voice setup`
     "commands": {"clear": {"confirm": true, "reply": false}, "compact": {"reply": false}},
     "idle_minutes": 20,       // mic off after this long with nothing sent
     "prompt": "Claude, Claude Code, iTerm, GitHub, …",   // vocabulary hint for Whisper

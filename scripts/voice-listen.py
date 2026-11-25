@@ -26,6 +26,8 @@
 #            voice listen once [--wake] [--json] [--timeout 120]
 #            = voice-listen.py --once …  → prints {"status": "heard"|"stop"|"timeout"|
 #              "busy"|"fail", "heard": "<text>"}. See /voice-app and docs/HOW-IT-WORKS.md.
+#          Setup wizard: voice setup (= voice-listen.py --setup): mic, room, wake-word
+#            training, speak-and-hear test, settings, cheat sheet.
 #          Room check (used by install.sh): voice-listen.py --measure-room [2]
 #            → {"ok", "median", "p95", "max", "threshold": "0.9%"} (stay quiet while it records)
 # Deps:    stdlib; brew whisper-cpp + sox; models in ~/.local/share/voiceloop/models/
@@ -79,6 +81,9 @@ DEFAULTS = {
     "cooldown": 0.6,             # pause after speech ends, so room echo dies down
     "wake": False,               # True = only sentences starting "Claude, …" are sent
     "follow_up_seconds": 30,     # after a reply, answer without the wake word for this long
+    "wake_words": [],            # extra spellings of "Claude" learned by `voice setup` on this Mac
+                                 # ("Bot", "Pod"); like "Cloud" they count only when punctuation
+                                 # or the end follows, so "Pod racing" stays an ordinary sentence
     # Earcons (macOS system sounds by name, or a file path; "" = off). Always played while
     # the mic is CLOSED, so the listener never records its own cues.
     # listening = mode starts / "Claude?" woke it; accepted = sent; ready = your turn; stopped = ended
@@ -357,7 +362,17 @@ def is_incomplete(text: str) -> bool:
     ("and…", "so…", "because…"). Whisper often adds a period after it, so strip
     punctuation before looking at the last word."""
     words = re.sub(r"[^a-z' ]", " ", text.lower()).split()
-    return bool(words) and words[-1] in DANGLING
+    if not words or words[-1] not in DANGLING:
+        return False
+    end = text.rstrip()[-1:]
+    if end in "?!":          # "Can we work on that?" is a finished question, never a pause
+        return False
+    if end == "." and words[-1] in ENDS_OK:   # "I like that." ends fine; "and." doesn't
+        return False
+    return True
+
+
+ENDS_OK = {"that", "which", "too", "also", "then", "like"}   # real sentence ends
 
 
 def is_stop(text: str, cfg: dict) -> bool:
@@ -493,7 +508,7 @@ def confirm_by_voice(cfg: dict, wav: str, cwd: str = "", rec=None, stt=None) -> 
     stt = stt or (lambda c, w: clean(transcribe(c, w), c))
     if rec(cfg, wav, deadline=time.time() + float(cfg["confirm_seconds"])) != "ok":
         return False
-    answer = strip_wake(stt(effective(cfg, cwd), wav))[0]
+    answer = strip_wake(stt(effective(cfg, cwd), wav), cfg.get("wake_words") or ())[0]
     log(f"confirmation heard: {answer!r}")
     return bool(YES.match(answer))
 
@@ -507,10 +522,34 @@ WAKE = re.compile(r"^(?:(?:hey|hi|ok|okay)[\s,.!]+)?"
                   r"(?:(?:claude|claud|clod|clawed)\b|cloud(?=[,.!?:;]|\s*$))[\s,.!?:;-]*", re.I)
 
 
-def strip_wake(text: str):
-    """("rest of sentence", True) if it starts with the wake word, else (text, False)."""
+def strip_wake(text: str, extra=()):
+    """("rest of sentence", True) if it starts with the wake word, else (text, False).
+    extra = this Mac's learned spellings (cfg "wake_words"), punctuation-guarded."""
     m = WAKE.match(text)
+    if not m and extra:
+        alts = "|".join(re.escape(w) for w in extra if w)
+        m = alts and re.match(rf"^(?:(?:hey|hi|ok|okay)[\s,.!]+)?(?:{alts})(?=[,.!?:;]|\s*$)[\s,.!?:;-]*",
+                             text, re.I)
     return (text[m.end():].strip(), True) if m else (text, False)
+
+
+NEVER_WAKE = {"yes", "no", "yeah", "yep", "okay", "ok", "so", "stop", "hey", "hi", "the", "a", "i",
+              "you", "and", "what", "why", "how", "wait", "hello", "thanks", "thank"}
+
+
+def wake_variants(heard: list) -> list:
+    """`voice setup` wake training: the user said "Claude" N times; return the spellings
+    Whisper produced that the wake check does NOT already accept, most frequent first.
+    Only one-word answers count, and everyday words are never learned."""
+    counts = {}
+    for t in heard:
+        words = re.sub(r"[^A-Za-z' ]", " ", t or "").split()
+        if len(words) != 1 or strip_wake(words[0] + ".")[1]:
+            continue
+        w = words[0].lower()
+        if len(w) >= 2 and w not in NEVER_WAKE:
+            counts[w] = counts.get(w, 0) + 1
+    return sorted(counts, key=lambda w: -counts[w])
 
 
 def norm(s: str) -> str:
@@ -586,8 +625,8 @@ class Gate:
     was held, then glued in FRONT of a real "Claude, ..." sentence, which then failed
     the wake check, and both were lost.)"""
 
-    def __init__(self, wake: bool, follow: float, stop=lambda t: False):
-        self.wake, self.follow, self.stop = wake, follow, stop
+    def __init__(self, wake: bool, follow: float, stop=lambda t: False, extra_wake=()):
+        self.wake, self.follow, self.stop, self.extra = wake, follow, stop, tuple(extra_wake or ())
         self.pending, self.pending_at, self.awake_until = "", 0.0, 0.0
 
     def replied(self, now: float) -> None:     # Claude just finished speaking
@@ -597,7 +636,7 @@ class Gate:
         if self.pending and now - self.pending_at > self.follow:
             self.pending = ""
         if self.wake:
-            text, woke = strip_wake(text)
+            text, woke = strip_wake(text, self.extra)
             if woke:
                 self.awake_until = now + self.follow
                 if not text and not self.pending:
@@ -642,7 +681,8 @@ def listen_once(cfg: dict, timeout: float, wake: bool = False, cwd: str = "",
         return {"status": "busy", "heard": ""}
     end = time.time() + timeout
     ecfg = effective(cfg, cwd)
-    gate = Gate(wake, float(cfg["follow_up_seconds"]), stop=lambda t: is_stop(t, cfg))
+    gate = Gate(wake, float(cfg["follow_up_seconds"]), stop=lambda t: is_stop(t, cfg),
+                extra_wake=cfg.get("wake_words") or ())
     try:   # a reply spoken just now opens the follow-up window, as in the loop
         spoke_at = LAST_SPOKEN().stat().st_mtime
         if time.time() - spoke_at < gate.follow:
@@ -691,6 +731,197 @@ def listen_once(cfg: dict, timeout: float, wake: bool = False, cwd: str = "",
     return {"status": "timeout", "heard": ""}
 
 
+# --- voice setup: an interactive first-run wizard (run in a terminal tab) ------------
+def parse_setting(raw: str, current, kind: str):
+    """Wizard input -> value. Empty = keep current. kind: seconds | minutes | yesno | percent."""
+    raw = raw.strip().lower()
+    if not raw:
+        return current
+    if kind == "yesno":
+        if raw in ("y", "yes", "on", "true", "1"):
+            return True
+        if raw in ("n", "no", "off", "false", "0"):
+            return False
+        raise ValueError("answer y or n")
+    if kind == "percent":
+        v = float(raw.rstrip("%"))
+        if not 0.05 <= v <= 20:
+            raise ValueError("between 0.05 and 20 (%)")
+        return f"{v:g}%"
+    v = float(raw)
+    lo, hi = {"seconds": (0.5, 120), "minutes": (1, 240)}[kind]
+    if not lo <= v <= hi:
+        raise ValueError(f"between {lo:g} and {hi:g}")
+    return int(v) if v.is_integer() else v
+
+
+def input_device() -> str:
+    """Name of the default input device (system_profiler), or ""."""
+    out = subprocess.run(["system_profiler", "SPAudioDataType"], capture_output=True, text=True,
+                         timeout=20).stdout.splitlines()
+    name = ""
+    for line in out:
+        if line.strip().endswith(":") and line.startswith(" " * 8) and not line.startswith(" " * 10):
+            name = line.strip()[:-1]
+        if "Default Input Device: Yes" in line:
+            return name
+    return ""
+
+
+def save_listen(changes: dict) -> Path:
+    """Merge `changes` into config.json's "listen" (backup first). Returns the backup path."""
+    path = voice_dir() / "config.json"
+    try:
+        full = json.loads(path.read_text())
+    except (OSError, ValueError):
+        full = {}
+    backup = path.with_name(f"config.json.bak-setup-{time.strftime('%Y%m%d-%H%M%S')}")
+    if path.exists():
+        backup.write_text(path.read_text())
+    full.setdefault("listen", {}).update(changes)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(full, indent=2) + "\n")
+    return backup
+
+
+def run_setup(cfg: dict) -> int:
+    """`voice setup`: mic check, room noise, wake-word training, a speak-and-hear test,
+    the main settings, and a cheat sheet. Nothing is saved until the end, and only
+    with a yes; config.json is backed up first."""
+    if listener_running():
+        print("The listener is running and owns the mic. Stop it first:  voice listen off")
+        return 1
+
+    def ask(q, default="y"):
+        try:
+            a = input(f"{q} [{default}] ").strip().lower() or default
+        except EOFError:
+            a = "n"          # no keyboard (piped/closed stdin): never change anything
+        return a.startswith("y")
+
+    def h(t):
+        print(f"\n\033[1m{t}\033[0m")
+
+    def pause(msg):
+        try:
+            input(msg)
+        except EOFError:
+            print()
+
+    changes, wav = {}, os.path.join(tempfile.mkdtemp(prefix="voiceloop-setup-"), "s.wav")
+    print("voiceLoop setup: about 3 minutes. Nothing is saved until the end.")
+
+    h("1/6  Microphone")
+    dev = input_device()
+    print(f"  Input device: {dev or 'unknown'}   (change it in System Settings > Sound > Input)")
+    vol = subprocess.run(["osascript", "-e", "input volume of (get volume settings)"],
+                         capture_output=True, text=True).stdout.strip()
+    if vol.isdigit():
+        print(f"  Input volume: {vol}" + ("   <- this is 0: nothing can be heard!" if vol == "0" else ""))
+    else:
+        print("  Input volume: set on the device itself (USB headsets don't expose it to macOS)")
+    pause("  Press Enter, then talk for 5 seconds to see the level meter…")
+    p = subprocess.Popen(["rec", "-q", "-r", str(RATE), "-c", "1", "-b", "16", "-e", "signed-integer",
+                          "-t", "raw", "-", "trim", "0", "5"], stdout=subprocess.PIPE,
+                         stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
+    peak, thr = 0.0, _threshold(cfg)
+    while (chunk := p.stdout.read(FRAME * 2 * 3)):
+        lvl = _rms(chunk)
+        peak = max(peak, lvl)
+        bar = int(min(lvl / 0.05, 1) * 40)
+        print(f"\r  {'#' * bar:<40} {lvl * 100:5.2f}%  {'SOUND' if lvl > thr else '     '}", end="", flush=True)
+    p.wait()
+    print()
+    if peak < 0.001:   # all zeros, or a muffled feed: what a missing permission looks like
+        print(f"  The mic gave (almost) pure silence ({peak * 100:.3f}%). If you did talk: give this terminal")
+        print("  app Microphone permission and relaunch it, check the mute switch, or pick another input.")
+        if not ask("  Continue anyway?", "n"):
+            return 1
+    print(f"  Peak {peak * 100:.2f}%: " + ("good." if peak > 0.02 else "quiet; move closer or raise the input volume."))
+
+    h("2/6  Room noise")
+    pause("  Press Enter, then stay quiet for 2 seconds…")
+    room = measure_room(2)
+    if room.get("ok"):
+        print(f"  Room: median {room['median']}%, peak {room['max']}%. Suggested threshold {room['threshold']}"
+              f" (now {cfg['threshold']}).")
+        if room["threshold"] != cfg["threshold"] and ask("  Use the suggested threshold?"):
+            changes["threshold"] = room["threshold"]
+            cfg["threshold"] = room["threshold"]
+    else:
+        print(f"  {room.get('why')}")
+
+    h("3/6  Wake word")
+    print('  Say "Claude" on its own after each sound, 5 times. This learns how Whisper hears you.')
+    heard = []
+    for i in range(5):
+        cue(cfg, "listening", block=True)
+        r = record(cfg, wav, deadline=time.time() + 6)
+        t = clean(transcribe(cfg, wav), cfg) if r == "ok" else ""
+        ok = bool(t) and strip_wake(t, cfg.get("wake_words") or ())[1]
+        print(f"  {i + 1}: {repr(t) if t else '(nothing heard)':24} "
+              f"{'ok' if ok else ('' if not t else 'NOT recognized')}")
+        heard.append(t)
+    new = [w for w in wake_variants(heard) if w not in (cfg.get("wake_words") or [])]
+    if new:
+        print(f"  Whisper also wrote: {', '.join(new)}. Accepting these as the wake word on this Mac is")
+        print("  safe-ish: they only count at the start and followed by punctuation (\"Pod, …\" / \"Pod.\").")
+        if ask(f"  Accept {', '.join(new)}?"):
+            changes["wake_words"] = list(cfg.get("wake_words") or []) + new
+            cfg["wake_words"] = changes["wake_words"]
+    elif not any(heard):
+        print("  Nothing was heard. Check the mic (step 1) and run voice setup again.")
+    else:
+        print("  Nothing new to learn. Tip: \"Hey Claude\" is recognized most reliably.")
+
+    h("4/6  Speak and hear")
+    print("  Say a sentence after the sound.")
+    cue(cfg, "listening", block=True)
+    r = record(cfg, wav, deadline=time.time() + 15)
+    t = clean(transcribe(effective(cfg, os.getcwd()), wav), cfg) if r == "ok" else ""
+    print(f"  Heard: {t or '(nothing)'}")
+    say_local(f"I heard: {t}" if t else "I didn't catch that.")
+
+    h("5/6  Settings (Enter keeps the current value)")
+    for key, kind, text in [
+            ("silence_seconds", "seconds", "Quiet time that ends your message and sends it"),
+            ("follow_up_seconds", "seconds", "After a reply, answer without saying the name for"),
+            ("idle_minutes", "minutes", "Turn the mic off after this long with nothing sent"),
+            ("wake", "yesno", "Always require the wake word (also for `voice listen`)")]:
+        while True:
+            cur = cfg[key]
+            shown = ("y" if cur else "n") if kind == "yesno" else cur
+            try:
+                raw = input(f"  {text}: [{shown}] ")
+            except EOFError:
+                raw = ""
+            try:
+                v = parse_setting(raw, cur, kind)
+                break
+            except ValueError as e:
+                print(f"    {e}")
+        if v != cur:
+            changes[key] = v
+
+    h("6/6  Cheat sheet")
+    print("  Start:    iTerm: voice session, then voice listen wake  ·  Claude app: /voice-app\n"
+          "  Talk:     \"Hey Claude, …\"  ·  no name needed for a while after a reply\n"
+          "  Local:    switch to <project> · which projects · voice help · stop listening\n"
+          "  Commands: \"command <name>\" for: " + ", ".join(cfg["commands"]) + "\n"
+          "  Terminal: voice stop · voice off all · voice listen status · voice status")
+
+    if not changes:
+        print("\nNo changes to save.")
+        return 0
+    print("\nChanges: " + ", ".join(f"{k} = {v}" for k, v in changes.items()))
+    if ask("Save them to ~/.claude/voice/config.json?"):
+        b = save_listen(changes)
+        print(f"Saved (backup: {b.name}). A running listener picks them up when restarted.")
+    else:
+        print("Not saved.")
+    return 0
+
+
 # --- main loop -------------------------------------------------------------------
 def loop(iterm_sid: str, claude_sid: str, cfg: dict, wake: bool = False) -> None:
     if claude_sid:  # make sure replies are spoken, or half-duplex would wait forever
@@ -704,7 +935,7 @@ def loop(iterm_sid: str, claude_sid: str, cfg: dict, wake: bool = False) -> None
         cwd = next((p["cwd"] for p in load_panes() if p.get("claude_session") == claude_sid),
                    os.getcwd())   # the target project's folder (for its vocabulary)
         follow = float(cfg["follow_up_seconds"])
-        gate = Gate(wake, follow, stop=lambda t: is_stop(t, cfg))
+        gate = Gate(wake, follow, stop=lambda t: is_stop(t, cfg), extra_wake=cfg.get("wake_words") or ())
         idle_s = float(cfg["idle_minutes"]) * 60
         last_active = time.time()   # sends and local commands count; ignored chatter doesn't
 
@@ -855,7 +1086,10 @@ def main() -> int:
     ap.add_argument("--wake", action="store_true", help="only accept sentences starting with 'Claude'")
     ap.add_argument("--measure-room", type=float, metavar="SECS", nargs="?", const=2.0,
                     help="record SECS (2) of room noise, print a suggested threshold as JSON")
+    ap.add_argument("--setup", action="store_true", help="interactive setup wizard (voice setup)")
     a = ap.parse_args()
+    if a.setup:
+        return run_setup(load_config())
     if a.measure_room is not None:
         print(json.dumps(measure_room(a.measure_room)))
         return 0
