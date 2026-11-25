@@ -39,7 +39,7 @@ the transcribed text goes to Claude, exactly as if you'd typed it. (Claude Code'
 
 - macOS (tested on macOS 26, Apple silicon) with [Homebrew](https://brew.sh)
 - Claude Code (tested with 2.1.326), in [iTerm2](https://iterm2.com) and/or the Claude desktop app
-- A mic (a headset works best). About 500 MB of downloads (150 MB with `--no-kokoro`).
+- A mic (a headset works best). About 850 MB of downloads (500 MB with `--no-kokoro`, less with `--whisper=base`).
 
 ## Quick start
 

@@ -10,8 +10,8 @@
 #          ./install.sh --no-kokoro                            # skip the 350 MB neural voice (use `say`)
 #          ./install.sh --quiet                                # no test sound
 #          ./install.sh --no-measure                           # skip the 2 s room-noise check
-#          ./install.sh --whisper=small                        # + the 466 MB small.en model: more
-#                                                                accurate, a bit slower (base is default)
+#          ./install.sh --whisper=base                         # the 148 MB base.en model instead of
+#                                                                small.en (466 MB): for old Macs / tight disks
 # Deps:    macOS, Homebrew. Scripts come from this repo's scripts/. Developers who keep the
 #          canonical copies elsewhere point $VOICELOOP_SRC (or an untracked .dev-source file)
 #          at that folder; then it installs from there and warns if scripts/ has drifted.
@@ -29,7 +29,7 @@ HOOKS=$HOME/.claude/hooks
 SHARE=$HOME/.local/share/voiceloop
 MIRROR=${VOICELOOP_MIRROR:-/nonexistent}
 SETTINGS=$HOME/.claude/settings.json
-CHECK=0; KOKORO=1; QUIET=0; MEASURE=1; WHISPER=base
+CHECK=0; KOKORO=1; QUIET=0; MEASURE=1; WHISPER=small
 for a in "$@"; do case $a in
   --check) CHECK=1 ;; --no-kokoro) KOKORO=0 ;; --quiet) QUIET=1 ;; --no-measure) MEASURE=0 ;;
   --whisper=*) WHISPER=${a#*=} ;;
@@ -43,8 +43,8 @@ step() { printf '\n\033[1m%s\033[0m\n' "$*"; }
 do_() { if (( CHECK )); then return 1; fi; "$@"; }   # act only when installing
 
 # name|path|sha256|url   (SHA-256 of the files as verified 2026-11-25)
+BASE="whisper base.en|models/ggml-base.en.bin|a03779c86df3323075f5e796cb2ce5029f00ec8869eee3fdfb897afe36c6d002|https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin"
 MODELS=(
-  "whisper base.en|models/ggml-base.en.bin|a03779c86df3323075f5e796cb2ce5029f00ec8869eee3fdfb897afe36c6d002|https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin"
   "Silero VAD|models/ggml-silero-v5.1.2.bin|29940d98d42b91fbd05ce489f3ecf7c72f0a42f027e4875919a28fb4c04ea2cf|https://huggingface.co/ggml-org/whisper-vad/resolve/main/ggml-silero-v5.1.2.bin"
 )
 SMALL="whisper small.en|models/ggml-small.en.bin|c6138d6d58ecc8322097e0f987c32f1be8bb0a18532a3f88f734d1bbf9c41e5d|https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.en.bin"
@@ -116,7 +116,8 @@ fetch() {   # $1 rel path, $2 url -> $SHARE/$1.part
   else echo "        downloading $(basename "$1")…"; curl -fL --progress-bar -o "$out" "$2"; fi
 }
 [[ $WHISPER == base || $WHISPER == small ]] || { echo "--whisper must be base or small" >&2; exit 2; }
-want=("${MODELS[@]}"); (( KOKORO )) && want+=("${KMODELS[@]}"); [[ $WHISPER == small ]] && want+=("$SMALL")
+want=("${MODELS[@]}"); (( KOKORO )) && want+=("${KMODELS[@]}")
+[[ $WHISPER == small ]] && want+=("$SMALL") || want+=("$BASE")
 for m in "${want[@]}"; do
   IFS='|' read -r name rel sha url <<<"$m"; f=$SHARE/$rel
   have=$( [[ -f $f ]] && shasum -a 256 "$f" | awk '{print $1}')
@@ -155,8 +156,8 @@ if [[ -f $cfg ]]; then
   jq -e . "$cfg" >/dev/null 2>&1 && pass "config.json exists and is valid (left as is)" || fail "config.json is not valid JSON"
   cur=$(jq -r '.listen.threshold // "0.5%"' "$cfg" 2>/dev/null)
   curm=$(jq -r '.listen.model // ""' "$cfg" 2>/dev/null)
-  if [[ $WHISPER == small && $curm != *small* ]]; then
-    todo+=("To use the small model, set it in your existing config:
+  if [[ $WHISPER == small && -n $curm && $curm != *small* ]]; then
+    todo+=("Your config pins another speech model. To use small.en (more accurate), set:
           jq '.listen.model = \"$SHARE/models/ggml-small.en.bin\"' $cfg > $cfg.new && mv $cfg.new $cfg")
   fi
   if [[ -n ${room:-} ]] && awk -v a="${thr%\%}" -v b="${cur%\%}" 'BEGIN{exit !(a > b)}'; then

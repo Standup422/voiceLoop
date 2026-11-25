@@ -4,7 +4,7 @@ Talk to Claude Code hands-free and hear it answer. Speech recognition (whisper.c
 (Kokoro) run **on your Mac**. Your audio never leaves it; only the text of what you said goes to
 Claude, the same as if you'd typed it.
 
-About 15 minutes, most of it downloads (about 500 MB, or 150 MB without the neural voice).
+About 15 minutes, most of it downloads (about 850 MB; 500 MB without the neural voice).
 
 ---
 
@@ -46,8 +46,8 @@ It runs `brew install` for missing tools without asking (use `--check` first to 
 missing). Kokoro's first use also has `uv` download its Python packages (pinned versions) from
 PyPI, and Python 3.13 if you don't have it.
 
-Options: `--whisper=small` (also get the 466 MB `small.en` speech model: more accurate, about
-0.2 s slower per sentence), `--no-kokoro` (skip the 350 MB neural voice and use the built-in macOS voice),
+Options: `--whisper=base` (the 148 MB `base.en` speech model instead of `small.en`: faster and
+smaller, but more mistakes on names and jargon; for older Macs or a tight disk), `--no-kokoro` (skip the 350 MB neural voice and use the built-in macOS voice),
 `--check` (test only, change nothing), `--help`.
 
 ## 4. The steps the installer leaves to you

@@ -70,7 +70,10 @@ DEFAULTS = {
     "threshold": "0.5%",         # RMS loudness that counts as sound (raise in a noisy room)
     "preroll": 0.5,              # seconds kept from BEFORE the trigger (soft first syllables)
     "max_seconds": 60,           # hard cap on one utterance
-    "model": str(MODELS / "ggml-base.en.bin"),
+    # small.en (default since 2026-11-25: 2 vs 6 words wrong of 44 on real speech, ~0.5 s);
+    # falls back to base.en on installs that only have that one
+    "model": str(MODELS / ("ggml-small.en.bin" if (MODELS / "ggml-small.en.bin").exists()
+                           else "ggml-base.en.bin")),
     "vad_model": str(MODELS / "ggml-silero-v5.1.2.bin"),
     # Vocabulary hint for Whisper + spelling fixes. Put YOUR words in config.json ("listen":
     # {"prompt": "...", "replacements": {...}}) or per project in <project>/.claude/voice.json.

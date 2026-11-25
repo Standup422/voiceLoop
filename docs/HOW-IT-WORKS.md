@@ -46,9 +46,9 @@ record ─► transcribe ─► clean + decide ─► type into the pane ─► 
 - **Recording:** its own endpointing on 30 ms frames. A recording starts when the loudness passes the
   `threshold`, keeps 0.5 s of *pre-roll* (so soft first syllables aren't clipped), and ends after
   `silence_seconds` (2.5) of quiet. The installer measures your room to pick the threshold.
-- **Transcription:** `whisper-cli` with the `base.en` model (about 0.3 s per sentence on Apple
-  silicon) or, with `./install.sh --whisper=small`, `small.en` (about 0.5 s, more accurate,
-  punctuates better), plus **Silero VAD**. The VAD drops
+- **Transcription:** `whisper-cli` with the `small.en` model (about 0.5–0.9 s per sentence on
+  Apple silicon; in a test on real speech it got 2 of 44 words wrong, against 6 for `base.en`) plus
+  **Silero VAD**. `./install.sh --whisper=base` uses the smaller, faster `base.en` instead. The VAD drops
   non-speech, which stops Whisper inventing words from silence. A stop list catches the classic
   inventions ("thanks for watching").
 - **Half-duplex:** the mic is closed while Claude thinks and speaks. A recording is also thrown
