@@ -610,6 +610,73 @@ class Benchmark(unittest.TestCase):
         self.assertEqual(names(vl.bench_models(d.name, "nope")), [])
 
 
+class BenchmarkRecord(unittest.TestCase):
+    """voice benchmark --record: read sentences once, keep the clips, score them every run.
+    Fake ask/rec/stt, so no microphone."""
+
+    def setUp(self):
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        self.dir = Path(d.name)
+        self.said = []
+
+    def run_record(self, answers, statuses=None, sentences=("One two.", "Three four.", "Five six.")):
+        answers, statuses = iter(answers), iter(statuses or [])
+
+        def ask(prompt):
+            return next(answers)
+
+        def rec(cfg, wav, deadline=0.0):
+            Path(wav).write_bytes(b"RIFF")
+            return next(statuses, "ok")
+
+        out = io.StringIO()
+        with unittest.mock.patch("sys.stdout", out):
+            n = vl.bench_record(CFG, list(sentences), self.dir, ask=ask, rec=rec,
+                                stt=lambda c, w: "heard it")
+        return n, out.getvalue()
+
+    def test_keep_skip_quit(self):
+        n, _ = self.run_record(["", "", "s", "q"])       # record+keep #1, skip #2, quit at #3
+        self.assertEqual(n, 1)
+        clips = vl.recorded_clips(self.dir)
+        self.assertEqual([t for t, _ in clips], ["One two."])
+        self.assertTrue(Path(clips[0][1]).exists())
+
+    def test_redo_then_keep(self):
+        n, out = self.run_record(["", "r", "", "", "q"], sentences=("One two.",))
+        self.assertEqual(n, 1)
+        self.assertEqual(out.count("heard: heard it"), 2)
+
+    def test_already_recorded_are_skipped(self):
+        self.run_record(["", "", "q"])
+        n, out = self.run_record(["", "", "", "", "q"])  # #1 is done: starts at #2
+        self.assertEqual(n, 2)
+        self.assertEqual(sorted(t for t, _ in vl.recorded_clips(self.dir)),
+                         ["Five six.", "One two.", "Three four."])
+
+    def test_nothing_heard_asks_again(self):
+        n, out = self.run_record(["", "", "", "q"], statuses=["timeout", "ok"], sentences=("One two.",))
+        self.assertEqual(n, 1)
+        self.assertIn("nothing heard", out)
+
+    def test_recorded_clips_ignores_missing_files_and_bad_index(self):
+        self.assertEqual(vl.recorded_clips(self.dir), [])
+        (self.dir / "clips.json").write_text("not json")
+        self.assertEqual(vl.recorded_clips(self.dir), [])
+        (self.dir / "a.wav").write_bytes(b"x")
+        (self.dir / "clips.json").write_text(json.dumps({"a.wav": "Hello.", "gone.wav": "Bye."}))
+        self.assertEqual(vl.recorded_clips(self.dir), [("Hello.", str(self.dir / "a.wav"))])
+
+    def test_summary_keeps_your_voice_separate(self):
+        rows = [dict(model="m", hint="on", voice="Samantha", ref="Run it.", heard="Run it.", secs=1),
+                dict(model="m", hint="on", voice="you", ref="Run it.", heard="Ran it.", secs=1)]
+        s = {g["speaker"]: g for g in vl.bench_summary(rows, [])}
+        self.assertEqual(s["computer"]["errors"], 0)
+        self.assertEqual(s["you"]["errors"], 1)
+        self.assertIn("you", vl.bench_report(list(s.values())))
+
+
 @unittest.skipUnless(HAVE_AUDIO, "needs say, sox, whisper-cli and the model")
 class BenchmarkAudio(unittest.TestCase):
     def test_one_sentence_end_to_end(self):
@@ -620,6 +687,16 @@ class BenchmarkAudio(unittest.TestCase):
         for r in rows:
             self.assertIn("run the tests", r["heard"].lower())
             self.assertGreater(r["secs"], 0)
+
+    def test_recorded_clips_are_scored_as_you(self):
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        wav = os.path.join(d.name, "mine.wav")
+        vl.make_clip("Commit the changes.", "Samantha", wav)   # stands in for a real recording
+        rows = vl.run_benchmark(CFG, [], ["Samantha"], [Path(CFG["model"])], cwd="",
+                                recorded=[("Commit the changes.", wav)])
+        self.assertEqual({r["voice"] for r in rows}, {"you"})
+        self.assertIn("commit", rows[0]["heard"].lower())
 
     def test_noise_still_transcribes(self):
         rows = vl.run_benchmark(CFG, ["Commit the changes."], ["Samantha"], [Path(CFG["model"])],

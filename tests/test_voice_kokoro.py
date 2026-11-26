@@ -26,6 +26,35 @@ class Helpers(unittest.TestCase):
         self.assertEqual(vk.sentences(""), [])
         self.assertEqual(vk.sentences("No end punctuation"), ["No end punctuation"])
 
+    # First sound waits for the whole FIRST chunk to be synthesized (measured 2026-11-25:
+    # 1.34 s for a short first sentence, 2.47 s for a 26-word one). So a long first
+    # sentence is split at its first comma; everything after is synthesized while it plays.
+    LONG = ("I looked at the listener log, and the problem was that the shared file made every "
+            "session's reply look like yours. The rest is on screen.")
+
+    def test_long_first_sentence_splits_at_first_comma(self):
+        self.assertEqual(vk.chunks(self.LONG), [
+            "I looked at the listener log,",
+            "and the problem was that the shared file made every session's reply look like yours.",
+            "The rest is on screen."])
+
+    def test_short_first_sentence_is_not_split(self):
+        self.assertEqual(vk.chunks("Yes, I see it. Ready?"), ["Yes, I see it.", "Ready?"])
+
+    def test_only_the_first_sentence_is_split(self):
+        later = "Done. " + self.LONG
+        self.assertEqual(vk.chunks(later), ["Done."] + vk.sentences(self.LONG))
+
+    def test_no_comma_or_comma_too_early_stays_whole(self):
+        no_comma = "This sentence is long enough to count but it has no comma anywhere in it at all."
+        self.assertEqual(vk.chunks(no_comma), [no_comma])
+        early = "Yes, this sentence is long enough to count and its only comma comes after one word."
+        self.assertEqual(vk.chunks(early), [early])
+
+    def test_chunks_lose_no_words(self):
+        for t in (self.LONG, "Yes, I see it.", "", "a, b, c d e f g h i j k l m n o p, q."):
+            self.assertEqual(" ".join(vk.chunks(t)).split(), t.split())
+
     def test_lang_from_voice_prefix(self):
         self.assertEqual(vk.lang_for("bf_emma"), "en-gb")
         self.assertEqual(vk.lang_for("bm_george"), "en-gb")

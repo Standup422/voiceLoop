@@ -10,6 +10,7 @@
 #          voice, SENTENCE BY SENTENCE. Sentence 1 is synthesized and starts playing
 #          while sentence 2 is synthesized, so the first sound waits for one short
 #          sentence, not the whole paragraph (whole-paragraph synthesis took 2-3 s).
+#          A long first sentence (> 12 words) is split at its first comma, too.
 # Usage:   Started detached by voice-speak.py when config "engine": "kokoro":
 #            echo "Hello there. Second sentence." | voice-kokoro.py --voice bf_emma
 #          Options: --voice bf_emma  --speed 1.0  --fallback-voice Samantha
@@ -40,6 +41,25 @@ MODELS = Path(os.environ.get("VOICELOOP_KOKORO_DIR") or Path.home() / ".local/sh
 def sentences(text: str) -> list:
     """Split after . ! ? (keeps the punctuation, which drives Kokoro's intonation)."""
     return [s for s in re.split(r"(?<=[.!?])\s+", text.strip()) if s.strip()]
+
+
+SPLIT_OVER = 12   # words: a longer FIRST sentence is split at a comma
+MIN_HEAD = 2      # words before that comma, so a lone "Yes," never becomes its own chunk
+
+
+def chunks(text: str) -> list:
+    """sentences(), but a long FIRST sentence is split after its first comma that has at
+    least MIN_HEAD words before it. The first sound waits for the whole first chunk to be
+    synthesized (1.34 s short vs 2.47 s for 26 words, measured 2026-11-25); later chunks are
+    synthesized while earlier ones play, so only the first one matters."""
+    out = sentences(text)
+    if not out or len(out[0].split()) <= SPLIT_OVER:
+        return out
+    words = out[0].split()
+    for i, w in enumerate(words[:-1]):
+        if w.endswith(",") and i + 1 >= MIN_HEAD:
+            return [" ".join(words[:i + 1]), " ".join(words[i + 1:])] + out[1:]
+    return out
 
 
 def lang_for(voice: str) -> str:
@@ -84,7 +104,7 @@ def main() -> int:
     lang = lang_for(a.voice)
 
     def produce(tmpdir: str) -> None:
-        for i, s in enumerate(sentences(text)):
+        for i, s in enumerate(chunks(text)):
             try:
                 samples, rate = k.create(s, voice=a.voice, speed=a.speed, lang=lang)
                 path = os.path.join(tmpdir, f"{i}.wav")

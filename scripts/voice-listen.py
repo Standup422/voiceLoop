@@ -30,6 +30,8 @@
 #          Setup wizard: voice setup (= voice-listen.py --setup): mic, room, wake-word
 #            training, speak-and-hear test, settings, cheat sheet.
 #          Benchmark (no mic): voice benchmark [--models base,small] [--noise] [--quick] [--show]
+#            voice benchmark --record: read the sentences once (terminal); the clips go to
+#            ~/.local/share/voiceloop/bench/ and every later run scores them as speaker "you".
 #            = voice-listen.py --benchmark …: `say` speaks known sentences (built-ins + your
 #            word list) to WAV, every model transcribes them with the word list off and on,
 #            prints accuracy, wake word caught, seconds per sentence, words it got wrong.
@@ -57,6 +59,7 @@ import argparse
 import array
 import collections
 import difflib
+import hashlib
 import json
 import math
 import os
@@ -1149,6 +1152,10 @@ BENCH_SENTENCES = [
 BENCH_TEMPLATES = ["Claude, tell me about {}.", "Open {} and check the settings.",
                    "What changed in {} today?"]
 BENCH_VOICES = ["Samantha", "Daniel"]
+# Your own recorded clips (voice benchmark --record): a data folder, deliberately NOT under
+# ~/.claude (a repo on some Macs). clips.json maps file name -> the sentence you read.
+BENCH_DIR = lambda: Path(os.environ.get("VOICELOOP_BENCH_DIR") or   # noqa: E731
+                         Path.home() / ".local" / "share" / "voiceloop" / "bench")
 
 
 def norm_words(text: str) -> list:
@@ -1201,9 +1208,10 @@ def bench_summary(rows: list, terms: list, extra_wake=()) -> list:
     seconds per sentence, and which vocabulary terms were missed how often."""
     groups: dict = {}
     for r in rows:
-        g = groups.setdefault((r["model"], r["hint"]), {
-            "model": r["model"], "hint": r["hint"], "errors": 0, "words": 0, "wake": 0,
-            "wake_total": 0, "secs": [], "missed": collections.Counter()})
+        who = "you" if r["voice"] == "you" else "computer"   # never average your voice into say's
+        g = groups.setdefault((r["model"], r["hint"], who), {
+            "model": r["model"], "hint": r["hint"], "speaker": who, "errors": 0, "words": 0,
+            "wake": 0, "wake_total": 0, "secs": [], "missed": collections.Counter()})
         e, w = word_errors(r["ref"], r["heard"])
         g["errors"] += e
         g["words"] += w
@@ -1220,16 +1228,17 @@ def bench_summary(rows: list, terms: list, extra_wake=()) -> list:
 
 
 def bench_report(summary: list) -> str:
-    lines = [f"{'model':<12}{'word list':<11}{'accuracy':>9}{'wake':>8}{'s/sentence':>12}"]
+    lines = [f"{'speaker':<10}{'model':<12}{'word list':<11}{'accuracy':>9}{'wake':>8}{'s/sentence':>12}"]
     for g in summary:
         acc = max(0.0, 100 * (1 - g["errors"] / g["words"])) if g["words"] else 0.0
         wake = f"{g['wake']}/{g['wake_total']}" if g["wake_total"] else "-"
-        lines.append(f"{g['model']:<12}{g['hint']:<11}{acc:>8.1f}%{wake:>8}{g['secs']:>12.2f}")
+        lines.append(f"{g.get('speaker', 'computer'):<10}{g['model']:<12}{g['hint']:<11}"
+                     f"{acc:>8.1f}%{wake:>8}{g['secs']:>12.2f}")
     missed = [g for g in summary if g["missed"]]
     if missed:
         lines.append("\nWords Whisper got wrong:")
         for g in missed:
-            lines.append(f"  {g['model']}, word list {g['hint']}: " +
+            lines.append(f"  {g.get('speaker', 'computer')}, {g['model']}, word list {g['hint']}: " +
                          ", ".join(f"{t} ×{n}" for t, n in g["missed"].most_common()))
     return "\n".join(lines)
 
@@ -1266,24 +1275,86 @@ def make_clip(text: str, voice: str, path: str, noise: float = 0.0) -> None:
 
 
 def run_benchmark(cfg: dict, sentences: list, voices: list, models: list, noise: float = 0.0,
-                  cwd: str = "", progress=lambda: None) -> list:
-    """Every sentence × voice × model × word list off/on -> rows for bench_summary()."""
+                  cwd: str = "", progress=lambda: None, recorded=()) -> list:
+    """Every sentence × voice × model × word list off/on -> rows for bench_summary().
+    recorded = [(sentence, wav)] of your own voice: scored too, as voice "you"."""
     on, off = effective(cfg, cwd), dict(cfg, prompt="", replacements={})
     rows = []
+
+    def score(text, voice, wav):
+        for m in models:
+            for hint, base in (("off", off), ("on", on)):
+                c = dict(base, model=str(m))
+                t0 = time.time()
+                heard = clean(transcribe(c, wav), c)
+                rows.append({"model": Path(m).name[5:-4], "hint": hint, "voice": voice,
+                             "ref": text, "heard": heard, "secs": time.time() - t0})
+                progress()
+
     with tempfile.TemporaryDirectory(prefix="voice-bench-") as d:
         for i, text in enumerate(sentences):
             for v in voices:
                 wav = os.path.join(d, f"{i}-{re.sub(r'[^A-Za-z0-9]', '', v)}.wav")
                 make_clip(text, v, wav, noise)
-                for m in models:
-                    for hint, base in (("off", off), ("on", on)):
-                        c = dict(base, model=str(m))
-                        t0 = time.time()
-                        heard = clean(transcribe(c, wav), c)
-                        rows.append({"model": Path(m).name[5:-4], "hint": hint, "voice": v,
-                                     "ref": text, "heard": heard, "secs": time.time() - t0})
-                        progress()
+                score(text, v, wav)
+    for text, wav in recorded:
+        score(text, "you", wav)
     return rows
+
+
+def recorded_clips(folder=None) -> list:
+    """[(sentence, wav path)] from your recordings; missing files and a bad index are skipped."""
+    folder = Path(folder or BENCH_DIR())
+    try:
+        index = json.loads((folder / "clips.json").read_text())
+    except (OSError, ValueError):
+        return []
+    if not isinstance(index, dict):
+        return []
+    return [(t, str(folder / f)) for f, t in index.items()
+            if isinstance(t, str) and re.fullmatch(r"[\w.-]+\.wav", str(f)) and (folder / f).exists()]
+
+
+def bench_record(cfg: dict, sentences: list, folder, ask=input, rec=None, stt=None) -> int:
+    """Read each sentence once; keep the clip. Sentences already recorded are skipped, so
+    you can stop (q) and continue later. Returns how many clips were kept this time."""
+    rec = rec or record
+    ecfg = effective(cfg, os.getcwd())
+    stt = stt or (lambda c, w: clean(transcribe(c, w), c))
+    folder = Path(folder)
+    folder.mkdir(parents=True, exist_ok=True)
+    try:
+        index = json.loads((folder / "clips.json").read_text())
+        index = index if isinstance(index, dict) else {}
+    except (OSError, ValueError):
+        index = {}
+    done, kept = set(index.values()), 0
+    todo = [t for t in sentences if t not in done]
+    if len(todo) < len(sentences):
+        print(f"{len(sentences) - len(todo)} already recorded; {len(todo)} to go.")
+    for n, text in enumerate(todo, 1):
+        print(f"\n[{n}/{len(todo)}] Say:  {text}")
+        while True:
+            a = ask("  Enter = record (stops after a pause), s = skip, q = done: ").strip().lower()
+            if a in ("q", "s"):
+                break
+            name = "clip-" + hashlib.sha1(text.encode()).hexdigest()[:10] + ".wav"
+            status = rec(cfg, str(folder / name), deadline=time.time() + 20)
+            if status != "ok":
+                print("  nothing heard (is the room too quiet for the threshold, or no mic permission?)")
+                continue
+            print(f"  heard: {stt(ecfg, str(folder / name))}")
+            if ask("  Enter = keep, r = redo: ").strip().lower() == "r":
+                continue
+            index[name] = text
+            (folder / "clips.json").write_text(json.dumps(index, indent=1))
+            kept += 1
+            break
+        if a == "q":
+            break
+    print(f"\nKept {kept} new clip(s); {len(index)} in {folder}. Now run: voice benchmark")
+    return kept
+
 
 
 def bench_cli(argv: list) -> int:
@@ -1298,6 +1369,9 @@ def bench_cli(argv: list) -> int:
                     help="built-in sentences only (not one per word-list term), first voice only")
     ap.add_argument("--show", action="store_true", help="print every sentence that came back wrong")
     ap.add_argument("--json", action="store_true", help="print the rows and summary as JSON")
+    ap.add_argument("--record", action="store_true",
+                    help="read the sentences aloud once (in a terminal); later runs score your voice too")
+    ap.add_argument("--no-recorded", action="store_true", help="leave your recorded clips out")
     a = ap.parse_args(argv)
     missing = [t for t in ("say", "sox", "whisper-cli") if not shutil.which(t)]
     if missing:
@@ -1315,14 +1389,25 @@ def bench_cli(argv: list) -> int:
         print(f"none of these voices are installed: {a.voices}", file=sys.stderr)
         return 1
     terms = [t.strip() for t in effective(cfg, cwd)["prompt"].split(",") if t.strip()]
+    if a.record:
+        if not (sys.stdin.isatty() and sys.stdout.isatty()):
+            print("voice benchmark --record is interactive: run it in a terminal window.", file=sys.stderr)
+            return 2
+        print("Read each sentence in your normal voice, at your normal distance from the mic.\n"
+              "Recording stops after a short pause. Stop any time with q; it continues later.")
+        bench_record(cfg, bench_sentences(terms, limit=len(terms)), BENCH_DIR())
+        return 0
+    recorded = [] if a.no_recorded else recorded_clips()
     sentences = list(BENCH_SENTENCES) if a.quick else bench_sentences(terms, limit=len(terms))
     if a.quick:
         voices = voices[:1]
-    total = len(sentences) * len(voices) * len(models) * 2
+    total = (len(sentences) * len(voices) + len(recorded)) * len(models) * 2
     if not a.json:
         print(f"voice benchmark: {len(sentences)} sentences × {len(voices)} voice(s) "
               f"({', '.join(voices)}) × {len(models)} model(s) × word list off/on = {total} runs, "
               f"{'pink noise ' + str(a.noise) if a.noise else 'clean audio'}"
+              + (f", plus {len(recorded)} of your recordings" if recorded else
+                 "\n(no recordings of your voice yet: voice benchmark --record)")
               + (f"\n(not installed, skipped: {', '.join(skipped)})" if skipped else ""))
     done = [0]
 
@@ -1331,7 +1416,7 @@ def bench_cli(argv: list) -> int:
         if not a.json and sys.stderr.isatty():
             print(f"\r  {done[0]}/{total}", end="", file=sys.stderr, flush=True)
 
-    rows = run_benchmark(cfg, sentences, voices, models, a.noise, cwd, tick)
+    rows = run_benchmark(cfg, sentences, voices, models, a.noise, cwd, tick, recorded)
     if not a.json and sys.stderr.isatty():
         print("\r" + " " * 20 + "\r", end="", file=sys.stderr)
     summary = bench_summary(rows, terms, cfg.get("wake_words") or ())

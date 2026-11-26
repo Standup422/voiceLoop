@@ -419,7 +419,8 @@ USAGE = """usage: voice on | off | session [on|off] | stop | status | test [text
   words [add X | fix heard = Right | remove X]   the word list Whisper should spell right
   setup         interactive first-run wizard (run it in a terminal window)
   benchmark     score the Whisper models on computer-spoken sentences, no mic needed
-                [--models base,small] [--noise] [--quick] [--show] [--json]"""
+                [--models base,small] [--noise] [--quick] [--show] [--json]
+                --record: read the sentences aloud once; later runs score your voice too"""
 
 
 def listener_pid() -> int:
