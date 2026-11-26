@@ -485,6 +485,114 @@ class ListenOnce(unittest.TestCase):
         self.assertEqual(self.run_once([("ok", "hello")])["status"], "busy")
 
 
+class Benchmark(unittest.TestCase):
+    """voice benchmark: score Whisper on synthetic speech. The scoring is pure and tested here;
+    the audio run is tested once at the end (BenchmarkAudio)."""
+
+    def test_word_errors_identical_ignores_case_and_punctuation(self):
+        self.assertEqual(vl.word_errors("Claude, run the tests.", "claude run the Tests"), (0, 4))
+
+    def test_word_errors_counts_substitution_deletion_insertion(self):
+        self.assertEqual(vl.word_errors("check the Zephyrine bus", "check the zefferine bus"), (1, 4))
+        self.assertEqual(vl.word_errors("check the Zephyrine bus", "check Zephyrine bus"), (1, 4))
+        self.assertEqual(vl.word_errors("check the Zephyrine bus", "check the zeffer in bus"), (2, 4))
+
+    def test_word_errors_empty(self):
+        self.assertEqual(vl.word_errors("run the tests", ""), (3, 3))
+        self.assertEqual(vl.word_errors("", ""), (0, 0))
+
+    def test_has_term_whole_words_only(self):
+        self.assertTrue(vl.has_term("ProofKit", "run the Proofkit deploy."))
+        self.assertTrue(vl.has_term("whisper.cpp", "build whisper.cpp again"))
+        self.assertTrue(vl.has_term("Home Assistant", "open home assistant"))
+        self.assertFalse(vl.has_term("ProofKit", "run the proof kit deploy"))
+        self.assertFalse(vl.has_term("sox", "soxx"))
+        self.assertFalse(vl.has_term("", "anything"))
+
+    def test_sentences_add_only_new_terms_once(self):
+        s = vl.bench_sentences(["Zephyrine", "zephyrine", "GitHub", "Claude", "Zigbee"], limit=12)
+        self.assertEqual(s[:len(vl.BENCH_SENTENCES)], vl.BENCH_SENTENCES)
+        extra = s[len(vl.BENCH_SENTENCES):]
+        self.assertEqual(len(extra), 2, extra)   # GitHub and Claude are in the built-ins already
+        self.assertTrue(vl.has_term("Zephyrine", extra[0]))
+        self.assertTrue(vl.has_term("Zigbee", extra[1]))
+
+    def test_sentences_limit(self):
+        s = vl.bench_sentences([f"Term{i}" for i in range(30)], limit=5)
+        self.assertEqual(len(s), len(vl.BENCH_SENTENCES) + 5)
+
+    def test_builtin_sentences_include_wake_and_plain(self):
+        wake = [s for s in vl.BENCH_SENTENCES if vl.strip_wake(s)[1]]
+        self.assertTrue(0 < len(wake) < len(vl.BENCH_SENTENCES))
+
+    def rows(self):
+        r = lambda model, hint, ref, heard, secs: dict(model=model, hint=hint, voice="V", ref=ref,
+                                                       heard=heard, secs=secs)
+        return [r("base.en", "off", "Claude, check the Zephyrine bus.", "Cloud, check the Zeffer in bus.", 0.3),
+                r("base.en", "off", "Commit the changes.", "Commit the changes.", 0.5),
+                r("base.en", "on", "Claude, check the Zephyrine bus.", "Claude, check the Zephyrine bus.", 0.4),
+                r("base.en", "on", "Commit the changes.", "Commit the change.", 0.4)]
+
+    def test_summary_scores_each_model_and_hint(self):
+        s = {(g["model"], g["hint"]): g for g in vl.bench_summary(self.rows(), ["Zephyrine"])}
+        off, on = s[("base.en", "off")], s[("base.en", "on")]
+        self.assertEqual((off["errors"], off["words"]), (3, 8))   # Cloud, Holland, +at
+        self.assertEqual((on["errors"], on["words"]), (1, 8))
+        self.assertEqual((off["wake"], off["wake_total"]), (1, 1))   # "Cloud," counts as the wake word
+        self.assertEqual(dict(off["missed"]), {"Zephyrine": 1})
+        self.assertEqual(dict(on["missed"]), {})
+        self.assertAlmostEqual(off["secs"], 0.4)
+
+    def test_summary_wake_missed(self):
+        rows = [dict(model="m", hint="on", voice="V", ref="Claude, run it.", heard="Run it.", secs=1)]
+        g = vl.bench_summary(rows, [])[0]
+        self.assertEqual((g["wake"], g["wake_total"]), (0, 1))
+
+    def test_report_lists_rows_and_missed_terms(self):
+        out = vl.bench_report(vl.bench_summary(self.rows(), ["Zephyrine"]))
+        self.assertIn("base.en", out)
+        self.assertIn("62.5%", out)      # 3 errors in 8 words
+        self.assertIn("87.5%", out)
+        self.assertIn("Zephyrine ×1", out)
+
+    def test_report_accuracy_never_negative(self):
+        rows = [dict(model="m", hint="on", voice="V", ref="hi", heard="a b c d", secs=1)]
+        self.assertIn(" 0.0%", vl.bench_report(vl.bench_summary(rows, [])))
+
+    def test_say_voice_names(self):
+        listing = ("Daniel (English (UK))   en_GB    # Hello! My name is Daniel.\n"
+                   "Samantha            en_US    # Hello! My name is Samantha.\n"
+                   "Eddy (German (Germany)) de_DE    # Hallo!\n")
+        self.assertEqual(vl.say_voices(listing), {"Daniel", "Samantha", "Eddy"})
+
+    def test_model_names(self):
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        for n in ("ggml-base.en.bin", "ggml-small.en.bin", "ggml-silero-v5.1.2.bin"):
+            (Path(d.name) / n).write_bytes(b"")
+        names = lambda ms: [m.name for m in ms]   # noqa: E731
+        self.assertEqual(names(vl.bench_models(d.name)), ["ggml-base.en.bin", "ggml-small.en.bin"])
+        self.assertEqual(names(vl.bench_models(d.name, "small")), ["ggml-small.en.bin"])
+        self.assertEqual(names(vl.bench_models(d.name, "nope")), [])
+
+
+@unittest.skipUnless(HAVE_AUDIO, "needs say, sox, whisper-cli and the model")
+class BenchmarkAudio(unittest.TestCase):
+    def test_one_sentence_end_to_end(self):
+        model = Path(CFG["model"])
+        rows = vl.run_benchmark(CFG, ["Claude, run the tests."], ["Samantha"], [model], cwd="")
+        self.assertEqual(len(rows), 2)                     # word list off and on
+        self.assertEqual({r["hint"] for r in rows}, {"off", "on"})
+        for r in rows:
+            self.assertIn("run the tests", r["heard"].lower())
+            self.assertGreater(r["secs"], 0)
+
+    def test_noise_still_transcribes(self):
+        rows = vl.run_benchmark(CFG, ["Commit the changes."], ["Samantha"], [Path(CFG["model"])],
+                                noise=0.02, cwd="")
+        self.assertIn("commit", rows[0]["heard"].lower())
+
+
 @unittest.skipUnless(HAVE_AUDIO, "needs say, sox, whisper-cli and the model")
 class Pipeline(unittest.TestCase):
     def setUp(self):

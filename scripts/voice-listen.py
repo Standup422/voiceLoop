@@ -29,6 +29,10 @@
 #          Word list: voice words [add X | fix heard = Right | remove X] (~/.claude/voice/words.txt)
 #          Setup wizard: voice setup (= voice-listen.py --setup): mic, room, wake-word
 #            training, speak-and-hear test, settings, cheat sheet.
+#          Benchmark (no mic): voice benchmark [--models base,small] [--noise] [--quick] [--show]
+#            = voice-listen.py --benchmark …: `say` speaks known sentences (built-ins + your
+#            word list) to WAV, every model transcribes them with the word list off and on,
+#            prints accuracy, wake word caught, seconds per sentence, words it got wrong.
 #          Room check (used by install.sh): voice-listen.py --measure-room [2]
 #            → {"ok", "median", "p95", "max", "threshold": "0.9%"} (stay quiet while it records)
 # Deps:    stdlib; brew whisper-cpp + sox; models in ~/.local/share/voiceloop/models/
@@ -56,6 +60,7 @@ import json
 import math
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -1118,6 +1123,225 @@ def loop(iterm_sid: str, claude_sid: str, cfg: dict, wake: bool = False) -> None
             cue(cfg, "ready", block=True)
 
 
+# --- voice benchmark: score Whisper on synthetic speech (no mic, no quiet room) ----------
+# `say` writes known sentences to WAV files; each Whisper model transcribes them with the
+# word list off (plain Whisper) and on (what the listener really sends); we score the result.
+# Computer voices are cleaner than a person in a room: good for comparing models and finding
+# words Whisper doesn't know, not for absolute accuracy on YOUR voice.
+BENCH_SENTENCES = [
+    "Claude, run the tests and tell me what failed.",
+    "Commit the changes and push them to GitHub.",
+    "Hey Claude, what does this error message mean?",
+    "Rename the function and update the TypeScript types.",
+    "Claude, open the JSON file and check the API settings.",
+    "Can you explain how the Stop hook works?",
+    "Claude, switch to the website project.",
+    "Read the log file and summarize the last hour.",
+]
+BENCH_TEMPLATES = ["Claude, tell me about {}.", "Open {} and check the settings.",
+                   "What changed in {} today?"]
+BENCH_VOICES = ["Samantha", "Daniel"]
+
+
+def norm_words(text: str) -> list:
+    return re.sub(r"[^a-z0-9']+", " ", text.lower()).split()
+
+
+def word_errors(ref: str, heard: str) -> tuple:
+    """(errors, words): word-level edit distance (substitutions + deletions + insertions)
+    and the reference length; word error rate = errors / words. Case and punctuation don't
+    count, spelling does ("Zeffer in" for "Zephyrine" = 1 substitution + 1 insertion)."""
+    r, h = norm_words(ref), norm_words(heard)
+    prev = list(range(len(h) + 1))
+    for i, rw in enumerate(r, 1):
+        cur = [i]
+        for j, hw in enumerate(h, 1):
+            cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (rw != hw)))
+        prev = cur
+    return prev[-1], len(r)
+
+
+def has_term(term: str, text: str) -> bool:
+    """The term appears as whole words (case and punctuation ignored)."""
+    t = " ".join(norm_words(term))
+    return bool(t) and f" {t} " in f" {' '.join(norm_words(text))} "
+
+
+def bench_sentences(vocab: list, limit: int = 12) -> list:
+    """The built-in sentences, plus one per vocabulary term they don't already contain."""
+    out, seen = list(BENCH_SENTENCES), set()
+    fresh = []
+    for t in vocab:
+        k = t.strip().lower()
+        if k and k not in seen and not any(has_term(t, s) for s in out):
+            seen.add(k)
+            fresh.append(t.strip())
+    for i, t in enumerate(fresh[:limit]):
+        out.append(BENCH_TEMPLATES[i % len(BENCH_TEMPLATES)].format(t))
+    return out
+
+
+def bench_models(folder, names: str = "") -> list:
+    """Whisper models in folder (not the Silero VAD), optionally only names like "base,small"."""
+    found = sorted(p for p in Path(folder).glob("ggml-*.bin") if "silero" not in p.name)
+    want = [n.strip() for n in names.split(",") if n.strip()]
+    return [p for p in found if not want or any(p.name[5:].startswith(w) for w in want)]
+
+
+def bench_summary(rows: list, terms: list, extra_wake=()) -> list:
+    """One entry per (model, word list off/on): errors, words, wake caught/total, mean
+    seconds per sentence, and which vocabulary terms were missed how often."""
+    groups: dict = {}
+    for r in rows:
+        g = groups.setdefault((r["model"], r["hint"]), {
+            "model": r["model"], "hint": r["hint"], "errors": 0, "words": 0, "wake": 0,
+            "wake_total": 0, "secs": [], "missed": collections.Counter()})
+        e, w = word_errors(r["ref"], r["heard"])
+        g["errors"] += e
+        g["words"] += w
+        g["secs"].append(r["secs"])
+        if strip_wake(r["ref"])[1]:
+            g["wake_total"] += 1
+            g["wake"] += strip_wake(r["heard"], extra_wake)[1]
+        for t in terms:
+            if has_term(t, r["ref"]) and not has_term(t, r["heard"]):
+                g["missed"][t] += 1
+    for g in groups.values():
+        g["secs"] = sum(g["secs"]) / len(g["secs"])
+    return list(groups.values())
+
+
+def bench_report(summary: list) -> str:
+    lines = [f"{'model':<12}{'word list':<11}{'accuracy':>9}{'wake':>8}{'s/sentence':>12}"]
+    for g in summary:
+        acc = max(0.0, 100 * (1 - g["errors"] / g["words"])) if g["words"] else 0.0
+        wake = f"{g['wake']}/{g['wake_total']}" if g["wake_total"] else "-"
+        lines.append(f"{g['model']:<12}{g['hint']:<11}{acc:>8.1f}%{wake:>8}{g['secs']:>12.2f}")
+    missed = [g for g in summary if g["missed"]]
+    if missed:
+        lines.append("\nWords Whisper got wrong:")
+        for g in missed:
+            lines.append(f"  {g['model']}, word list {g['hint']}: " +
+                         ", ".join(f"{t} ×{n}" for t, n in g["missed"].most_common()))
+    return "\n".join(lines)
+
+
+def say_voices(listing: str | None = None) -> set:
+    """Names `say -v` accepts. Listing lines look like
+    "Daniel (English (UK))   en_GB    # Hello! My name is Daniel." or "Samantha   en_US  # …"."""
+    if listing is None:
+        try:
+            listing = subprocess.run(["say", "-v", "?"], capture_output=True, text=True,
+                                     timeout=20).stdout
+        except (OSError, subprocess.SubprocessError):
+            return set()
+    return {re.split(r"\s{2,}|\s\(", line.strip())[0] for line in listing.splitlines() if line.strip()}
+
+
+def make_clip(text: str, voice: str, path: str, noise: float = 0.0) -> None:
+    """Speech as the mic would deliver it: 16 kHz mono, a little silence around it,
+    optionally pink noise (noise = its amplitude, e.g. 0.02) for a room that isn't quiet."""
+    raw = path + ".raw.wav"
+    subprocess.run(["say", "-v", voice, "-o", raw, "--data-format=LEI16@16000", text],
+                   check=True, capture_output=True, timeout=60)
+    if not noise:
+        subprocess.run(["sox", raw, path, "pad", "0.3", "0.6"], check=True, capture_output=True)
+        return
+    with wave.open(raw) as w:
+        secs = w.getnframes() / w.getframerate() + 0.9
+    hiss = path + ".noise.wav"
+    subprocess.run(["sox", "-n", "-r", "16000", "-c", "1", "-b", "16", hiss,
+                    "synth", f"{secs:.2f}", "pinknoise", "vol", str(noise)], check=True, capture_output=True)
+    padded = path + ".pad.wav"
+    subprocess.run(["sox", raw, padded, "pad", "0.3", "0.6"], check=True, capture_output=True)
+    subprocess.run(["sox", "-m", padded, hiss, path], check=True, capture_output=True)
+
+
+def run_benchmark(cfg: dict, sentences: list, voices: list, models: list, noise: float = 0.0,
+                  cwd: str = "", progress=lambda: None) -> list:
+    """Every sentence × voice × model × word list off/on -> rows for bench_summary()."""
+    on, off = effective(cfg, cwd), dict(cfg, prompt="", replacements={})
+    rows = []
+    with tempfile.TemporaryDirectory(prefix="voice-bench-") as d:
+        for i, text in enumerate(sentences):
+            for v in voices:
+                wav = os.path.join(d, f"{i}-{re.sub(r'[^A-Za-z0-9]', '', v)}.wav")
+                make_clip(text, v, wav, noise)
+                for m in models:
+                    for hint, base in (("off", off), ("on", on)):
+                        c = dict(base, model=str(m))
+                        t0 = time.time()
+                        heard = clean(transcribe(c, wav), c)
+                        rows.append({"model": Path(m).name[5:-4], "hint": hint, "voice": v,
+                                     "ref": text, "heard": heard, "secs": time.time() - t0})
+                        progress()
+    return rows
+
+
+def bench_cli(argv: list) -> int:
+    ap = argparse.ArgumentParser(prog="voice benchmark",
+                                 description="Score the Whisper models on computer-spoken sentences "
+                                             "(no microphone): word list off vs on.")
+    ap.add_argument("--models", default="", help="e.g. base,small (default: every installed model)")
+    ap.add_argument("--voices", default=",".join(BENCH_VOICES), help="macOS voices for `say`")
+    ap.add_argument("--noise", type=float, nargs="?", const=0.02, default=0.0,
+                    help="mix in pink noise (amplitude, default 0.02) like a room that isn't quiet")
+    ap.add_argument("--quick", action="store_true",
+                    help="built-in sentences only (not one per word-list term), first voice only")
+    ap.add_argument("--show", action="store_true", help="print every sentence that came back wrong")
+    ap.add_argument("--json", action="store_true", help="print the rows and summary as JSON")
+    a = ap.parse_args(argv)
+    missing = [t for t in ("say", "sox", "whisper-cli") if not shutil.which(t)]
+    if missing:
+        print(f"voice benchmark needs: {', '.join(missing)}", file=sys.stderr)
+        return 1
+    cfg, cwd = load_config(), os.getcwd()
+    models = bench_models(Path(cfg["model"]).parent, a.models)
+    if not models:
+        print(f"no Whisper models found in {Path(cfg['model']).parent}", file=sys.stderr)
+        return 1
+    have = say_voices()
+    voices = [v.strip() for v in a.voices.split(",") if v.strip() in have]
+    skipped = [v.strip() for v in a.voices.split(",") if v.strip() and v.strip() not in have]
+    if not voices:
+        print(f"none of these voices are installed: {a.voices}", file=sys.stderr)
+        return 1
+    terms = [t.strip() for t in effective(cfg, cwd)["prompt"].split(",") if t.strip()]
+    sentences = list(BENCH_SENTENCES) if a.quick else bench_sentences(terms, limit=len(terms))
+    if a.quick:
+        voices = voices[:1]
+    total = len(sentences) * len(voices) * len(models) * 2
+    if not a.json:
+        print(f"voice benchmark: {len(sentences)} sentences × {len(voices)} voice(s) "
+              f"({', '.join(voices)}) × {len(models)} model(s) × word list off/on = {total} runs, "
+              f"{'pink noise ' + str(a.noise) if a.noise else 'clean audio'}"
+              + (f"\n(not installed, skipped: {', '.join(skipped)})" if skipped else ""))
+    done = [0]
+
+    def tick():
+        done[0] += 1
+        if not a.json and sys.stderr.isatty():
+            print(f"\r  {done[0]}/{total}", end="", file=sys.stderr, flush=True)
+
+    rows = run_benchmark(cfg, sentences, voices, models, a.noise, cwd, tick)
+    if not a.json and sys.stderr.isatty():
+        print("\r" + " " * 20 + "\r", end="", file=sys.stderr)
+    summary = bench_summary(rows, terms, cfg.get("wake_words") or ())
+    if a.json:
+        print(json.dumps({"rows": rows, "summary": summary}, indent=1))
+        return 0
+    print(bench_report(summary))
+    if a.show:
+        bad = [r for r in rows if word_errors(r["ref"], r["heard"])[0]]
+        print("\nWrong sentences:" if bad else "\nNo wrong sentences.")
+        for r in bad:
+            print(f"  [{r['model']}, word list {r['hint']}, {r['voice']}]\n"
+                  f"    said:  {r['ref']}\n    heard: {r['heard']}")
+    print("\nNote: computer voices are cleaner than a real voice in a real room. Use this to\n"
+          "compare models and find words to add (voice words add X), not as your own accuracy.")
+    return 0
+
+
 def words_cli(args: list) -> int:
     """voice words [list] | add <word or phrase> | fix <heard> = <Right> | remove <word>"""
     path, sub = WORDS(), (args[0] if args else "list")
@@ -1163,6 +1387,8 @@ def words_cli(args: list) -> int:
 def main() -> int:
     if sys.argv[1:2] == ["--words"]:
         return words_cli(sys.argv[2:])
+    if sys.argv[1:2] == ["--benchmark"]:
+        return bench_cli(sys.argv[2:])
     ap = argparse.ArgumentParser(description="voiceLoop conversation mode")
     ap.add_argument("--iterm-session", default=os.environ.get("ITERM_SESSION_ID", ""))
     ap.add_argument("--claude-session", default=os.environ.get("CLAUDE_CODE_SESSION_ID", ""))

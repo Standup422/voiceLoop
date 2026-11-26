@@ -119,6 +119,7 @@ In a Claude Code session:
   which asks you to say yes first. Add your own skills to `"commands"` in the config.
 - "**stop listening**" turns the mic off.
 - Names it keeps getting wrong? `voice words add Zephyrine`, or `voice words fix cube control = kubectl`.
+  Then `voice benchmark` (no mic needed) shows which words Whisper still misses.
 
 ### Good to know
 - **Sounds:** a soft **pluck** means it's listening, a **purr** means your message was sent, and a

@@ -30,7 +30,8 @@ the transcribed text goes to Claude, exactly as if you'd typed it. (Claude Code'
 - **Spoken slash commands, safely:** "command compact", "command clear" (asks for a spoken
   yes first). Only commands on your allowlist run.
 - **A word list** (`voice words add …`) plus per-project vocabulary, so Whisper spells your names
-  and terms right.
+  and terms right. `voice benchmark` checks it without a microphone: the Mac speaks test
+  sentences, and each Whisper model is scored with the word list off and on.
 - **Safety:** speech can't become a shell or slash command; nothing is typed into a pane where Claude
   isn't running; the mic turns off after 20 quiet minutes.
 - **One-command, self-testing install** that measures your room's noise to set the mic sensitivity.

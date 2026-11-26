@@ -14,6 +14,7 @@
 #                  voice listen [on|wake|off|status|switch <project>|once [--wake --json]]
 #                  voice setup   (interactive first-run wizard: mic, wake word, settings)
 #                  voice words [add X | fix heard = Right | remove X]   (Whisper word list)
+#                  voice benchmark [--models base,small] [--noise] [--quick] [--show]   (no mic)
 #          Debug:  voice-speak.py --dry-run < payload.json   # print cleaned text only
 # Deps:    stdlib only; macOS `say`. Optional ~/.claude/voice/config.json:
 #          {"engine":"say"|"kokoro","voice":"Samantha","kokoro_voice":"bf_emma","rate":200,...}
@@ -414,7 +415,9 @@ USAGE = """usage: voice on | off | session [on|off] | stop | status | test [text
   listen switch <project>   retarget the running listener
   status --json machine-readable state for dashboards (no transcript text)
   words [add X | fix heard = Right | remove X]   the word list Whisper should spell right
-  setup         interactive first-run wizard (run it in a terminal window)"""
+  setup         interactive first-run wizard (run it in a terminal window)
+  benchmark     score the Whisper models on computer-spoken sentences, no mic needed
+                [--models base,small] [--noise] [--quick] [--show] [--json]"""
 
 
 def listener_pid() -> int:
@@ -613,6 +616,9 @@ def cli(args: list) -> int:
     elif cmd == "words":   # word list for Whisper; lives in voice-listen.py (it reads it)
         script = Path(__file__).resolve().parent / "voice-listen.py"
         os.execv(str(script), [str(script), "--words", *args[1:]])
+    elif cmd == "benchmark":   # Whisper scoring; lives in voice-listen.py (it owns transcribe)
+        script = Path(__file__).resolve().parent / "voice-listen.py"
+        os.execv(str(script), [str(script), "--benchmark", *args[1:]])
     elif cmd == "setup":   # interactive wizard; lives in voice-listen.py (it owns the mic code)
         if any(x in ("-h", "--help", "help") for x in args[1:]):
             print("voice setup: interactive first-run wizard, about 3 minutes. Run it in a terminal\n"

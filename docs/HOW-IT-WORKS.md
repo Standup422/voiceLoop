@@ -174,6 +174,26 @@ words first, then your list, then the config's `prompt`. `voice words` warns whe
 [`examples/voice.json`](../examples/voice.json)). When the listener targets that project, its
 words go first in Whisper's prompt and its replacements win. It's re-read on every utterance.
 
+**Benchmark, no microphone:** `voice benchmark` has macOS `say` speak known sentences into WAV
+files (the built-in ones plus one per word in your vocabulary), runs every installed Whisper
+model on them with the word list **off** (plain Whisper) and **on** (what the listener sends),
+and scores the result:
+
+```text
+model       word list   accuracy    wake  s/sentence
+base.en     off            86.5%    8/22        0.33
+base.en     on             97.2%   18/22        0.31
+small.en    off            87.4%    9/22        0.56
+small.en    on             99.2%   22/22        0.57
+```
+
+Accuracy is 1 − word error rate (wrong, missing and extra words ÷ words said). "wake" counts
+how often a "Claude, …" sentence was recognised as addressed to Claude. Below the table it lists
+the words Whisper got wrong: add those with `voice words add`. Options: `--models base,small`,
+`--noise [0.02]` (mixes in pink noise), `--quick` (built-in sentences, one voice), `--show`
+(every wrong sentence, said vs heard), `--json`. Computer voices are cleaner than a person in a
+room, so use it to compare models and find missing words, not as your own accuracy.
+
 ## Security model
 
 - **Anyone within earshot can talk to Claude** while the listener runs: a person, or a video
