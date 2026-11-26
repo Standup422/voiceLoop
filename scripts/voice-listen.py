@@ -27,13 +27,17 @@
 #            = voice-listen.py --once …  → prints {"status": "heard"|"stop"|"timeout"|
 #              "busy"|"fail", "heard": "<text>"}. See /voice-app and docs/HOW-IT-WORKS.md.
 #          Word list: voice words [add X | fix heard = Right | remove X] (~/.claude/voice/words.txt)
-#          Setup wizard: voice setup (= voice-listen.py --setup): mic, room, wake-word
-#            training, speak-and-hear test, settings, cheat sheet.
+#          Setup wizard: voice setup (= voice-listen.py --setup): mic (pick which input),
+#            room, wake-word training, speak-and-hear test, settings, cheat sheet.
+#          Mic: "device" in config.json's "listen" = an input's exact name ("" = the macOS
+#            default). Unplugged -> the default is used until it's back (logged). A new mic
+#            needs a new threshold: run the setup's room-noise step again.
 #          Benchmark (no mic): voice benchmark [--models base,small] [--noise] [--quick] [--show]
 #            voice benchmark --record: read the sentences once (terminal); the clips go to
 #            ~/.local/share/voiceloop/bench/ and every later run scores them as speaker "you".
 #            = voice-listen.py --benchmark …: `say` speaks known sentences (built-ins + your
-#            word list) to WAV, every model transcribes them with the word list off and on,
+#            word list) to WAV (plus two Kokoro voices, kokoro:af_heart / kokoro:bm_george, when
+#            Kokoro is installed), every model transcribes them with the word list off and on,
 #            prints accuracy, wake word caught, seconds per sentence, words it got wrong.
 #          Room check (used by install.sh): voice-listen.py --measure-room [2]
 #            → {"ok", "median", "p95", "max", "threshold": "0.9%"} (stay quiet while it records)
@@ -92,6 +96,9 @@ DEFAULTS = {
     "stop_phrases": ["stop listening"],
     "reply_timeout": 600,        # max seconds to wait for Claude to answer + speak
     "cooldown": 0.6,             # pause after speech ends, so room echo dies down
+    "device": "",                # mic: "" = the macOS default input; or an input's exact name
+                                 # ("RIG WX1"), so a webcam or AirPods becoming the default
+                                 # can't take over. Unplugged -> the default is used meanwhile.
     "wake": False,               # True = only sentences starting "Claude, …" are sent
     "follow_up_seconds": 30,     # after a reply, answer without the wake word for this long
     "wake_words": [],            # extra spellings of "Claude" learned by `voice setup` on this Mac
@@ -225,11 +232,28 @@ def suggest_threshold(levels: list) -> dict:
             "max": round(v[-1] * 100, 3), "threshold": f"{pct:g}%"}
 
 
-def measure_room(secs: float = 2.0) -> dict:
+def rec_cmd(device: str = "", *tail: str) -> list:
+    """The sox command that streams the mic as raw 16 kHz 16-bit mono PCM to stdout.
+    device "" = the macOS default input (`rec`). A name records from that CoreAudio input
+    instead; it must match the name exactly (sox fails fast with exit 2 otherwise)."""
+    head = ["sox", "-q", "-t", "coreaudio", device] if device else ["rec", "-q"]
+    return head + ["-r", str(RATE), "-c", "1", "-b", "16", "-e", "signed-integer",
+                   "-t", "raw", "-", *tail]
+
+
+def device_missing(device: str, status: str, returncode) -> bool:
+    """True when a chosen mic couldn't be opened (unplugged, renamed): sox exited by itself
+    with an error before any sound. Our own terminate() gives -15, a normal end 0."""
+    return bool(device) and status == "fail" and returncode not in (0, None, -15)
+
+
+def measure_room(secs: float = 2.0, device: str = "") -> dict:
     """Record `secs` of room sound (stay quiet) and suggest a threshold."""
-    p = subprocess.run(["rec", "-q", "-r", str(RATE), "-c", "1", "-b", "16", "-e", "signed-integer",
-                        "-t", "raw", "-", "trim", "0", str(secs)],
+    p = subprocess.run(rec_cmd(device, "trim", "0", str(secs)),
                        stdin=subprocess.DEVNULL, capture_output=True, timeout=secs + 15)
+    if device and p.returncode and not p.stdout:
+        log(f"mic {device!r} not available; measuring the default input")
+        return measure_room(secs)
     data, n = p.stdout, FRAME * 2
     return suggest_threshold([_rms(data[i:i + n]) for i in range(0, len(data) - n + 1, n)])
 
@@ -284,16 +308,21 @@ def record(cfg: dict, wav: str, deadline: float = 0.0) -> str:
     """Mic -> capture() -> wav. Returns "ok", "fail", or "spoke": TTS started while
     the mic was open (e.g. the reply to something typed), so the recording is
     discarded. Otherwise we'd transcribe Samantha and send her words back to Claude."""
-    p = subprocess.Popen(["rec", "-q", "-r", str(RATE), "-c", "1", "-b", "16",
-                          "-e", "signed-integer", "-t", "raw", "-"],
-                         stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+    device = str(cfg.get("device") or "")
+    p = subprocess.Popen(rec_cmd(device), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                          stderr=subprocess.DEVNULL)
     try:
         status, pcm = capture(p.stdout, cfg, interrupted=lambda: speaking() or CONTROL().exists(),
                               deadline=deadline)
     finally:
-        p.terminate()
+        if p.poll() is None:
+            p.terminate()
         p.wait()
+    if device_missing(device, status, p.returncode):
+        # The chosen mic is gone (unplugged): keep listening on the default input rather
+        # than stop. Retried every utterance, so plugging it back in switches back.
+        log(f"mic {device!r} not available; using the default input")
+        return record({**cfg, "device": ""}, wav, deadline)
     if status == "ok":
         write_wav(wav, pcm)
     return status
@@ -738,7 +767,8 @@ def listen_once(cfg: dict, timeout: float, wake: bool = False, cwd: str = "",
             gate.replied(spoke_at)
     except OSError:
         pass
-    log(f"app mode: listening for one utterance (max {timeout:.0f} s{', wake word' if wake else ''})")
+    log(f"app mode: listening for one utterance (max {timeout:.0f} s{', wake word' if wake else ''}"
+        f"{', mic ' + repr(cfg['device']) if cfg.get('device') else ''})")
     with tempfile.TemporaryDirectory(prefix="voiceloop-once-") as td:
         wav = os.path.join(td, "utt.wav")
         while time.time() < end:
@@ -804,17 +834,51 @@ def parse_setting(raw: str, current, kind: str):
     return int(v) if v.is_integer() else v
 
 
-def input_device() -> str:
-    """Name of the default input device (system_profiler), or ""."""
-    out = subprocess.run(["system_profiler", "SPAudioDataType"], capture_output=True, text=True,
-                         timeout=20).stdout.splitlines()
-    name = ""
-    for line in out:
+def parse_input_devices(text: str) -> tuple:
+    """system_profiler SPAudioDataType text -> ([input names, in order, no duplicates],
+    default input name or ""). A device is an input when it lists "Input Channels"; its
+    name is the 8-space-indented "Name:" line above. A headset can appear twice (input
+    and output halves), so names are de-duplicated."""
+    names, default, name = [], "", ""
+    for line in text.splitlines():
         if line.strip().endswith(":") and line.startswith(" " * 8) and not line.startswith(" " * 10):
             name = line.strip()[:-1]
-        if "Default Input Device: Yes" in line:
-            return name
-    return ""
+        elif name and ("Input Channels:" in line or "Default Input Device: Yes" in line):
+            if name not in names:
+                names.append(name)
+            if "Default Input Device: Yes" in line:
+                default = name
+    return names, default
+
+
+def input_devices() -> tuple:
+    """([input device names], default input name), from system_profiler (~0.5 s)."""
+    try:
+        out = subprocess.run(["system_profiler", "SPAudioDataType"], capture_output=True,
+                             text=True, timeout=20).stdout
+    except (OSError, subprocess.SubprocessError):
+        out = ""
+    return parse_input_devices(out)
+
+
+def input_device() -> str:
+    """Name of the default input device, or ""."""
+    return input_devices()[1]
+
+
+def pick_device(answer: str, names: list, current: str):
+    """The setup wizard's mic choice. Enter keeps `current`; a number picks from `names`
+    (1-based); 0 = follow the macOS default (""). Anything else -> None (ask again)."""
+    a = answer.strip()
+    if not a:
+        return current
+    if a.isdigit():
+        i = int(a)
+        if i == 0:
+            return ""
+        if 1 <= i <= len(names):
+            return names[i - 1]
+    return None
 
 
 def save_listen(changes: dict) -> Path:
@@ -861,18 +925,42 @@ def run_setup(cfg: dict) -> int:
     print("voiceLoop setup: about 3 minutes. Nothing is saved until the end.")
 
     h("1/6  Microphone")
-    dev = input_device()
-    print(f"  Input device: {dev or 'unknown'}   (change it in System Settings > Sound > Input)")
-    vol = subprocess.run(["osascript", "-e", "input volume of (get volume settings)"],
-                         capture_output=True, text=True).stdout.strip()
-    if vol.isdigit():
-        print(f"  Input volume: {vol}" + ("   <- this is 0: nothing can be heard!" if vol == "0" else ""))
-    else:
-        print("  Input volume: set on the device itself (USB headsets don't expose it to macOS)")
+    names, default = input_devices()
+    current = str(cfg.get("device") or "")
+    if names:
+        print("  Inputs on this Mac:")
+        print(f"    0  follow the macOS default (now: {default or 'unknown'})"
+              + ("   <- current" if not current else ""))
+        for i, n in enumerate(names, 1):
+            print(f"    {i}  {n}" + ("   (macOS default)" if n == default else "")
+                  + ("   <- current" if n == current else ""))
+        if current and current not in names:
+            print(f"  Your chosen mic {current!r} isn't connected; the default is used until it is.")
+        while True:
+            try:
+                ans = input("  Which mic? Enter = keep, 0 = follow the default: ")
+            except EOFError:
+                ans = ""
+            choice = pick_device(ans, names, current)
+            if choice is not None:
+                break
+            print(f"  Type a number from 0 to {len(names)}, or press Enter.")
+        if choice != current:
+            changes["device"] = choice
+            cfg["device"] = choice
+    dev = cfg.get("device") or default
+    print(f"  Listening with: {dev or 'unknown'}"
+          + ("" if cfg.get("device") else "   (the macOS default: System Settings > Sound > Input)"))
+    if not cfg.get("device"):
+        vol = subprocess.run(["osascript", "-e", "input volume of (get volume settings)"],
+                             capture_output=True, text=True).stdout.strip()
+        if vol.isdigit():
+            print(f"  Input volume: {vol}" + ("   <- this is 0: nothing can be heard!" if vol == "0" else ""))
+        else:
+            print("  Input volume: set on the device itself (USB headsets don't expose it to macOS)")
     pause("  Press Enter, then talk for 5 seconds to see the level meter…")
-    p = subprocess.Popen(["rec", "-q", "-r", str(RATE), "-c", "1", "-b", "16", "-e", "signed-integer",
-                          "-t", "raw", "-", "trim", "0", "5"], stdout=subprocess.PIPE,
-                         stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
+    p = subprocess.Popen(rec_cmd(str(cfg.get("device") or ""), "trim", "0", "5"),
+                         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
     peak, thr = 0.0, _threshold(cfg)
     while (chunk := p.stdout.read(FRAME * 2 * 3)):
         lvl = _rms(chunk)
@@ -890,7 +978,7 @@ def run_setup(cfg: dict) -> int:
 
     h("2/6  Room noise")
     pause("  Press Enter, then stay quiet for 2 seconds…")
-    room = measure_room(2)
+    room = measure_room(2, str(cfg.get("device") or ""))
     if room.get("ok"):
         print(f"  Room: median {room['median']}%, peak {room['max']}%. Suggested threshold {room['threshold']}"
               f" (now {cfg['threshold']}).")
@@ -987,7 +1075,8 @@ def loop(iterm_sid: str, claude_sid: str, cfg: dict, wake: bool = False) -> None
         (tmp_dir() / f"claude-voice.{claude_sid}").touch()
         TARGET().write_text(claude_sid)  # tells voice-speak's UserPromptSubmit hook who we talk to
     log(f"conversation mode ON (pane {iterm_sid.split(':')[-1][:8]}"
-        f"{', wake word: Claude' if wake else ''}); say 'stop listening' to end")
+        f"{', wake word: Claude' if wake else ''}{', mic ' + repr(cfg['device']) if cfg.get('device') else ''});"
+        " say 'stop listening' to end")
     cue(cfg, "listening", block=True)
     with tempfile.TemporaryDirectory(prefix="voiceloop-") as td:
         wav = os.path.join(td, "utt.wav")
@@ -1152,14 +1241,61 @@ BENCH_SENTENCES = [
 BENCH_TEMPLATES = ["Claude, tell me about {}.", "Open {} and check the settings.",
                    "What changed in {} today?"]
 BENCH_VOICES = ["Samantha", "Daniel"]
+# Neural voices as extra speakers (when Kokoro is installed): they sound less like a robot
+# than `say`, and add an American woman and a British man with different stress and pace.
+KOKORO = "kokoro:"
+BENCH_KOKORO = [KOKORO + "af_heart", KOKORO + "bm_george"]
+KOKORO_SCRIPT = lambda: Path(__file__).resolve().parent / "voice-kokoro.py"   # noqa: E731
+KOKORO_MODEL = lambda: Path(os.environ.get("VOICELOOP_KOKORO_DIR") or          # noqa: E731
+                            Path.home() / ".local/share/voiceloop/kokoro") / "kokoro-v1.0.onnx"
+
+
+def kokoro_available() -> bool:
+    return KOKORO_SCRIPT().exists() and KOKORO_MODEL().exists() and bool(shutil.which("uv"))
+
+
+def kokoro_clips(sentences: list, voice: str, folder: str) -> list:
+    """Synthesize every sentence with Kokoro `voice` ("af_heart") in ONE process (the model
+    loads once). -> [raw wav path per sentence], or [] if Kokoro failed."""
+    os.makedirs(folder, exist_ok=True)
+    try:
+        p = subprocess.run([str(KOKORO_SCRIPT()), "--to-dir", folder, "--voice", voice],
+                           input="\n".join(s.replace("\n", " ") for s in sentences),
+                           capture_output=True, text=True, timeout=60 + 10 * len(sentences))
+    except (OSError, subprocess.SubprocessError) as e:
+        log(f"benchmark: Kokoro {voice} failed: {e}")
+        return []
+    paths = [os.path.join(folder, f"{i}.wav") for i in range(len(sentences))]
+    if p.returncode or not all(os.path.exists(x) for x in paths):
+        log(f"benchmark: Kokoro {voice} failed: {p.stderr.strip()[-200:]}")
+        return []
+    return paths
 # Your own recorded clips (voice benchmark --record): a data folder, deliberately NOT under
 # ~/.claude (a repo on some Macs). clips.json maps file name -> the sentence you read.
 BENCH_DIR = lambda: Path(os.environ.get("VOICELOOP_BENCH_DIR") or   # noqa: E731
                          Path.home() / ".local" / "share" / "voiceloop" / "bench")
 
 
+# British and American spellings of the same word are the same word to a listener:
+# Whisper wrote "summarise" for a British voice saying "summarize". Applied to BOTH sides,
+# so a rule only has to be consistent, not a real word ("promise" -> "promize" both ways).
+# Deliberately no general -our -> -or rule: "four" would become "for".
+_SPELLING = [(re.compile(r"(?<=\w\w)is(e|es|ed|ing|ation|ations)$"), r"iz\1"),   # summarise, organisation
+             (re.compile(r"(?<=\w\w)ys(e|es|ed|ing)$"), r"yz\1")]                 # analyse
+_SPELLING_WORDS = {"colour": "color", "colours": "colors", "behaviour": "behavior",
+                   "favourite": "favorite", "centre": "center", "licence": "license",
+                   "grey": "gray", "programme": "program"}
+
+
+def us_spelling(word: str) -> str:
+    word = _SPELLING_WORDS.get(word, word)
+    for rx, rep in _SPELLING:
+        word = rx.sub(rep, word)
+    return word
+
+
 def norm_words(text: str) -> list:
-    return re.sub(r"[^a-z0-9']+", " ", text.lower()).split()
+    return [us_spelling(w) for w in re.sub(r"[^a-z0-9']+", " ", text.lower()).split()]
 
 
 def word_errors(ref: str, heard: str) -> tuple:
@@ -1255,12 +1391,19 @@ def say_voices(listing: str | None = None) -> set:
     return {re.split(r"\s{2,}|\s\(", line.strip())[0] for line in listing.splitlines() if line.strip()}
 
 
-def make_clip(text: str, voice: str, path: str, noise: float = 0.0) -> None:
+def make_clip(text: str, voice: str, path: str, noise: float = 0.0, raw: str = "") -> None:
     """Speech as the mic would deliver it: 16 kHz mono, a little silence around it,
-    optionally pink noise (noise = its amplitude, e.g. 0.02) for a room that isn't quiet."""
-    raw = path + ".raw.wav"
-    subprocess.run(["say", "-v", voice, "-o", raw, "--data-format=LEI16@16000", text],
-                   check=True, capture_output=True, timeout=60)
+    optionally pink noise (noise = its amplitude, e.g. 0.02) for a room that isn't quiet.
+    raw = already-synthesized speech (Kokoro, 24 kHz) to use instead of `say`."""
+    if raw:   # Kokoro's 24 kHz -> the mic's 16 kHz mono 16-bit (sox resamples on the way)
+        conv = path + ".16k.wav"
+        subprocess.run(["sox", raw, "-r", "16000", "-c", "1", "-b", "16", conv],
+                       check=True, capture_output=True)
+        raw = conv
+    else:
+        raw = path + ".raw.wav"
+        subprocess.run(["say", "-v", voice, "-o", raw, "--data-format=LEI16@16000", text],
+                       check=True, capture_output=True, timeout=60)
     if not noise:
         subprocess.run(["sox", raw, path, "pad", "0.3", "0.6"], check=True, capture_output=True)
         return
@@ -1292,10 +1435,16 @@ def run_benchmark(cfg: dict, sentences: list, voices: list, models: list, noise:
                 progress()
 
     with tempfile.TemporaryDirectory(prefix="voice-bench-") as d:
+        neural = {}   # "kokoro:af_heart" -> [raw wav per sentence], synthesized up front
+        for v in voices:
+            if v.startswith(KOKORO):
+                neural[v] = kokoro_clips(sentences, v[len(KOKORO):], os.path.join(d, v[len(KOKORO):]))
         for i, text in enumerate(sentences):
             for v in voices:
+                if v.startswith(KOKORO) and not neural.get(v):
+                    continue   # Kokoro failed for this voice (logged): leave it out
                 wav = os.path.join(d, f"{i}-{re.sub(r'[^A-Za-z0-9]', '', v)}.wav")
-                make_clip(text, v, wav, noise)
+                make_clip(text, v, wav, noise, raw=neural[v][i] if v.startswith(KOKORO) else "")
                 score(text, v, wav)
     for text, wav in recorded:
         score(text, "you", wav)
@@ -1362,7 +1511,9 @@ def bench_cli(argv: list) -> int:
                                  description="Score the Whisper models on computer-spoken sentences "
                                              "(no microphone): word list off vs on.")
     ap.add_argument("--models", default="", help="e.g. base,small (default: every installed model)")
-    ap.add_argument("--voices", default=",".join(BENCH_VOICES), help="macOS voices for `say`")
+    ap.add_argument("--voices", default="",
+                    help="macOS voices for `say`, and Kokoro voices as kokoro:<name> "
+                         f"(default: {','.join(BENCH_VOICES + BENCH_KOKORO)}; Kokoro ones if installed)")
     ap.add_argument("--noise", type=float, nargs="?", const=0.02, default=0.0,
                     help="mix in pink noise (amplitude, default 0.02) like a room that isn't quiet")
     ap.add_argument("--quick", action="store_true",
@@ -1383,10 +1534,13 @@ def bench_cli(argv: list) -> int:
         print(f"no Whisper models found in {Path(cfg['model']).parent}", file=sys.stderr)
         return 1
     have = say_voices()
-    voices = [v.strip() for v in a.voices.split(",") if v.strip() in have]
-    skipped = [v.strip() for v in a.voices.split(",") if v.strip() and v.strip() not in have]
+    neural_ok = kokoro_available()
+    wanted = a.voices or ",".join(BENCH_VOICES + (BENCH_KOKORO if neural_ok else []))
+    usable = lambda v: neural_ok if v.startswith(KOKORO) else v in have   # noqa: E731
+    voices = [v.strip() for v in wanted.split(",") if v.strip() and usable(v.strip())]
+    skipped = [v.strip() for v in wanted.split(",") if v.strip() and not usable(v.strip())]
     if not voices:
-        print(f"none of these voices are installed: {a.voices}", file=sys.stderr)
+        print(f"none of these voices are installed: {wanted}", file=sys.stderr)
         return 1
     terms = [t.strip() for t in effective(cfg, cwd)["prompt"].split(",") if t.strip()]
     if a.record:
@@ -1407,7 +1561,7 @@ def bench_cli(argv: list) -> int:
               f"({', '.join(voices)}) × {len(models)} model(s) × word list off/on = {total} runs, "
               f"{'pink noise ' + str(a.noise) if a.noise else 'clean audio'}"
               + (f", plus {len(recorded)} of your recordings" if recorded else
-                 "\n(no recordings of your voice yet: voice benchmark --record)")
+                 "" if a.no_recorded else "\n(no recordings of your voice yet: voice benchmark --record)")
               + (f"\n(not installed, skipped: {', '.join(skipped)})" if skipped else ""))
     done = [0]
 
@@ -1503,7 +1657,7 @@ def main() -> int:
             return 2
         return run_setup(load_config())
     if a.measure_room is not None:
-        print(json.dumps(measure_room(a.measure_room)))
+        print(json.dumps(measure_room(a.measure_room, str(load_config().get("device") or ""))))
         return 0
     cfg = load_config()
     # A plain SIGTERM would kill Python without running `finally`/`with` cleanup: rec

@@ -14,6 +14,8 @@
 # Usage:   Started detached by voice-speak.py when config "engine": "kokoro":
 #            echo "Hello there. Second sentence." | voice-kokoro.py --voice bf_emma
 #          Options: --voice bf_emma  --speed 1.0  --fallback-voice Samantha
+#          Benchmark clips (no playback, no `say` fallback; exit 1 if Kokoro can't run):
+#            printf 'One.\nTwo.\n' | voice-kokoro.py --to-dir DIR --voice af_heart  → DIR/0.wav, 1.wav
 # Deps:    uv; Python 3.13 (onnxruntime has no 3.15 wheels yet, so the shebang pins it);
 #          kokoro-onnx + soundfile, pinned (uv installs them from PyPI into its cache on the
 #          first run; exclude-newer freezes their dependencies too);
@@ -83,12 +85,34 @@ def log_first_audio() -> None:
         pass
 
 
+def to_dir(folder: str, lines: list, voice: str, speed: float) -> int:
+    """Synthesize each line to <folder>/<n>.wav (Kokoro's own rate, 24 kHz). The model loads
+    once for all lines: a process per sentence would pay uv + model start every time."""
+    try:
+        import soundfile as sf
+        from kokoro_onnx import Kokoro
+        k = Kokoro(str(MODELS / "kokoro-v1.0.onnx"), str(MODELS / "voices-v1.0.bin"))
+        for i, line in enumerate(lines):
+            if line.strip():
+                samples, rate = k.create(line.strip(), voice=voice, speed=speed, lang=lang_for(voice))
+                sf.write(os.path.join(folder, f"{i}.wav"), samples, rate)
+    except Exception as e:
+        print(f"voice-kokoro: {e}", file=sys.stderr)
+        return 1
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--voice", default="bf_emma")
     ap.add_argument("--speed", type=float, default=1.0)
     ap.add_argument("--fallback-voice", default="Samantha")
+    ap.add_argument("--to-dir", default="",
+                    help="don't play: write one WAV per stdin LINE (0.wav, 1.wav, …) into this "
+                         "folder (voice benchmark). No `say` fallback: exit 1 if Kokoro can't run")
     a = ap.parse_args()
+    if a.to_dir:
+        return to_dir(a.to_dir, sys.stdin.read().splitlines(), a.voice, a.speed)
     text = sys.stdin.read().strip()
     if not text:
         return 0

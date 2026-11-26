@@ -212,6 +212,111 @@ class Clean(unittest.TestCase):
         self.assertFalse(vl.is_stop("Don't stop listening to the logs yet", CFG))
 
 
+class MicDevice(unittest.TestCase):
+    """Choosing the mic ("device" in config): sox command, unplugged fallback, setup parsing."""
+
+    PROFILER = """Audio:
+
+    Devices:
+
+        Studio Display:
+          Output Channels: 2
+          Transport: DisplayPort
+
+        USB Headset:
+          Default Input Device: Yes
+          Input Channels: 1
+          Transport: USB
+
+        USB Headset:
+          Default Output Device: Yes
+          Output Channels: 2
+          Transport: USB
+
+        Webcam Mic:
+          Input Channels: 2
+          Transport: USB
+
+        Built-in Speakers:
+          Output Channels: 2
+          Transport: Built-in
+"""
+
+    def test_default_device_uses_rec(self):
+        cmd = vl.rec_cmd("")
+        self.assertEqual(cmd[:2], ["rec", "-q"])
+        self.assertNotIn("coreaudio", cmd)
+        self.assertEqual(cmd[-1], "-")
+
+    def test_named_device_uses_coreaudio(self):
+        cmd = vl.rec_cmd("Webcam Mic", "trim", "0", "5")
+        self.assertEqual(cmd[:5], ["sox", "-q", "-t", "coreaudio", "Webcam Mic"])
+        self.assertEqual(cmd[-3:], ["trim", "0", "5"])
+        self.assertIn("16000", cmd)   # same format as the default path
+
+    def test_device_missing_only_when_sox_failed_by_itself(self):
+        self.assertTrue(vl.device_missing("Webcam Mic", "fail", 2))       # can't open device
+        self.assertFalse(vl.device_missing("Webcam Mic", "fail", -15))    # we stopped it
+        self.assertFalse(vl.device_missing("Webcam Mic", "ok", 2))        # got speech: not missing
+        self.assertFalse(vl.device_missing("Webcam Mic", "timeout", -15))
+        self.assertFalse(vl.device_missing("", "fail", 2))                # default: nothing to fall back to
+
+    def test_parse_inputs_and_default(self):
+        names, default = vl.parse_input_devices(self.PROFILER)
+        self.assertEqual(names, ["USB Headset", "Webcam Mic"])   # outputs left out, no duplicate
+        self.assertEqual(default, "USB Headset")
+        self.assertEqual(vl.parse_input_devices(""), ([], ""))
+
+    def test_pick_device(self):
+        names = ["USB Headset", "Webcam Mic"]
+        self.assertEqual(vl.pick_device("", names, "Webcam Mic"), "Webcam Mic")   # Enter keeps
+        self.assertEqual(vl.pick_device("2", names, ""), "Webcam Mic")
+        self.assertEqual(vl.pick_device(" 0 ", names, "Webcam Mic"), "")          # follow default
+        self.assertIsNone(vl.pick_device("3", names, ""))
+        self.assertIsNone(vl.pick_device("webcam", names, ""))
+
+    def test_unplugged_mic_falls_back_to_default(self):
+        """A chosen mic that can't be opened must not end listening: record() retries
+        once on the default input."""
+        calls = []
+
+        class Proc:
+            def __init__(self, cmd, **kw):
+                calls.append(cmd)
+                self.stdout = io.BytesIO(b"")          # sox gave nothing
+                self.returncode = 2 if "coreaudio" in cmd else 0
+
+            def poll(self):
+                return self.returncode
+
+            def terminate(self):
+                pass
+
+            def wait(self):
+                return self.returncode
+
+        with unittest.mock.patch.object(vl.subprocess, "Popen", Proc), \
+             unittest.mock.patch.object(vl, "speaking", lambda: False):
+            r = vl.record({**CFG, "device": "Webcam Mic"}, os.path.join(tempfile.gettempdir(), "x.wav"))
+        self.assertEqual(r, "fail")                    # the default gave nothing either
+        self.assertEqual(len(calls), 2)                # tried the chosen mic, then the default once
+        self.assertIn("coreaudio", calls[0])
+        self.assertEqual(calls[1][0], "rec")
+
+    def test_device_setting_loads(self):
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        Path(d.name, "config.json").write_text(json.dumps({"listen": {"device": "Webcam Mic"}}))
+        old = os.environ.get("CLAUDE_VOICE_DIR")
+        os.environ["CLAUDE_VOICE_DIR"] = d.name
+        try:
+            c = vl.load_config()
+        finally:
+            os.environ.pop("CLAUDE_VOICE_DIR") if old is None else os.environ.__setitem__("CLAUDE_VOICE_DIR", old)
+        self.assertEqual(c["device"], "Webcam Mic")
+        self.assertEqual(vl.DEFAULTS["device"], "")    # out of the box: the macOS default
+
+
 class SpokenCommands(unittest.TestCase):
     """Deliberate slash commands: trigger word + allowlist (+ spoken yes for /clear)."""
     ALLOWED = {"clear": {"confirm": True, "reply": False}, "compact": {"reply": False},
@@ -531,6 +636,15 @@ class Benchmark(unittest.TestCase):
         self.assertEqual(vl.word_errors("check the Zephyrine bus", "check Zephyrine bus"), (1, 4))
         self.assertEqual(vl.word_errors("check the Zephyrine bus", "check the zeffer in bus"), (2, 4))
 
+    def test_british_and_american_spelling_score_the_same(self):
+        """2026-11-26: small.en wrote 'summarise' for Kokoro bm_george saying 'summarize'."""
+        self.assertEqual(vl.word_errors("summarize the last hour", "summarise the last hour"), (0, 4))
+        self.assertEqual(vl.word_errors("analyze the color", "analyse the colour"), (0, 3))
+        self.assertEqual(vl.word_errors("the organization", "the organisation"), (0, 2))
+        self.assertEqual(vl.word_errors("four tests", "for tests"), (1, 2))      # not a spelling variant
+        self.assertEqual(vl.word_errors("rise", "rise"), (0, 1))                  # short words untouched
+        self.assertEqual(vl.us_spelling("promise"), vl.us_spelling("promise"))    # consistent both ways
+
     def test_word_errors_empty(self):
         self.assertEqual(vl.word_errors("run the tests", ""), (3, 3))
         self.assertEqual(vl.word_errors("", ""), (0, 0))
@@ -697,6 +811,28 @@ class BenchmarkAudio(unittest.TestCase):
                                 recorded=[("Commit the changes.", wav)])
         self.assertEqual({r["voice"] for r in rows}, {"you"})
         self.assertIn("commit", rows[0]["heard"].lower())
+
+    def _kokoro_stand_in(self, text):
+        """A 24 kHz clip, like Kokoro writes (made with `say`, so no model is needed)."""
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        raw = os.path.join(d.name, "0.wav")
+        subprocess.run(["say", "-v", "Samantha", "-o", raw, "--data-format=LEI16@24000", text], check=True)
+        return raw
+
+    def test_kokoro_voice_uses_its_presynthesized_clip(self):
+        raw = self._kokoro_stand_in("Commit the changes.")
+        with unittest.mock.patch.object(vl, "kokoro_clips", lambda s, v, f: [raw] * len(s)):
+            rows = vl.run_benchmark(CFG, ["Commit the changes."], ["kokoro:af_heart"],
+                                    [Path(CFG["model"])], cwd="")
+        self.assertEqual({r["voice"] for r in rows}, {"kokoro:af_heart"})
+        self.assertIn("commit", rows[0]["heard"].lower())   # 24 kHz was resampled to 16 kHz
+
+    def test_failed_kokoro_voice_is_left_out(self):
+        with unittest.mock.patch.object(vl, "kokoro_clips", lambda s, v, f: []):
+            rows = vl.run_benchmark(CFG, ["Commit the changes."], ["kokoro:af_heart", "Samantha"],
+                                    [Path(CFG["model"])], cwd="")
+        self.assertEqual({r["voice"] for r in rows}, {"Samantha"})   # no crash, Samantha still scored
 
     def test_noise_still_transcribes(self):
         rows = vl.run_benchmark(CFG, ["Commit the changes."], ["Samantha"], [Path(CFG["model"])],

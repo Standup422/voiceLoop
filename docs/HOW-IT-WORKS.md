@@ -134,6 +134,8 @@ are only here for explanation: the real file is plain JSON.)
   "mode": "first_paragraph",  // or "full"
   "max_chars": 600,
   "listen": {
+    "device": "",             // mic: "" = the macOS default input, or an input's exact name
+                              // (pick it in `voice setup`); unplugged = default until it's back
     "threshold": "0.5%",      // loudness that counts as sound (install.sh measures your room)
     "silence_seconds": 2.5,   // quiet this long = you're done
     "wake": false,            // true = always use the wake word
@@ -175,7 +177,8 @@ words first, then your list, then the config's `prompt`. `voice words` warns whe
 words go first in Whisper's prompt and its replacements win. It's re-read on every utterance.
 
 **Benchmark, no microphone:** `voice benchmark` has macOS `say` speak known sentences into WAV
-files (the built-in ones plus one per word in your vocabulary), runs every installed Whisper
+files (the built-in ones plus one per word in your vocabulary; with Kokoro installed, two of its
+neural voices read them too, `kokoro:af_heart` and `kokoro:bm_george`), runs every installed Whisper
 model on them with the word list **off** (plain Whisper) and **on** (what the listener sends),
 and scores the result:
 

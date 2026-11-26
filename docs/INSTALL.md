@@ -139,6 +139,7 @@ In a Claude Code session:
 |---|---|
 | It never hears me | Microphone permission + **relaunch** the app (step 4c). Look at `voice listen status`. |
 | It never stops recording | The room is louder than the sensitivity setting. Re-run `./install.sh` in a quiet moment, or raise `"threshold"` (e.g. `"1%"`) under `"listen"` in `~/.claude/voice/config.json`. |
+| It hears the wrong mic (a webcam, AirPods) | Run `voice setup` and pick your mic in step 1; it stays chosen even when macOS switches the default. Then let the setup measure the room again: every mic needs its own threshold. |
 | It ignores me in wake mode | Say **"Hey Claude, …"**. `voice listen status` shows what it heard. |
 | No voice at all | `voice status`: is it on for this session? `voice session` turns it on. Were the hooks registered (step 4a), and was Claude Code restarted? |
 | `voice: command not found` | Step 4b (PATH). |

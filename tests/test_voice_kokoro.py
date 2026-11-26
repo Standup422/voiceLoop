@@ -20,6 +20,20 @@ spec.loader.exec_module(vk)
 
 
 class Helpers(unittest.TestCase):
+    def test_to_dir_fails_loudly_without_kokoro(self):
+        """voice benchmark needs a clear failure (exit 1), never the `say` fallback that
+        playback uses: a benchmark speaker must be the voice it claims to be."""
+        import tempfile
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        old = vk.MODELS
+        vk.MODELS = Path(d.name) / "missing"
+        try:
+            self.assertEqual(vk.to_dir(d.name, ["Hello there."], "af_heart", 1.0), 1)
+        finally:
+            vk.MODELS = old
+        self.assertEqual(os.listdir(d.name), [])
+
     def test_sentences_keep_punctuation(self):
         self.assertEqual(vk.sentences("Yes, I see it. Say switch to Acme! Ready?  "),
                          ["Yes, I see it.", "Say switch to Acme!", "Ready?"])
