@@ -413,6 +413,30 @@ class WaitForReply(unittest.TestCase):
         vl.wait_for_reply({"reply_timeout": 0.6, "quiet_seconds": 0}, time.time(), "sid")
         self.assertGreaterEqual(time.time() - t0, 0.5)
 
+    # Known limit until 2026-11-25: one shared claude-voice.last.txt, so ANOTHER voiced
+    # session's reply ended this listener's wait and opened the mic while ours was coming.
+    def test_other_sessions_reply_does_not_end_the_wait(self):
+        sent = time.time() - 5
+        vl.LAST_SPOKEN().write_text("another session's reply")
+        vl.spoke_file("other-session").write_text("")
+        t0 = time.time()
+        vl.wait_for_reply({"reply_timeout": 0.6, "cooldown": 0}, sent, "my-session")
+        self.assertGreaterEqual(time.time() - t0, 0.5)
+
+    def test_own_reply_ends_the_wait(self):
+        sent = time.time() - 5
+        vl.spoke_file("my-session").write_text("")
+        t0 = time.time()
+        vl.wait_for_reply({"reply_timeout": 5, "cooldown": 0}, sent, "my-session")
+        self.assertLess(time.time() - t0, 1.0)
+
+    def test_without_a_session_id_the_shared_file_still_works(self):
+        sent = time.time() - 5
+        vl.LAST_SPOKEN().write_text("reply")
+        t0 = time.time()
+        vl.wait_for_reply({"reply_timeout": 5, "cooldown": 0}, sent, "")
+        self.assertLess(time.time() - t0, 1.0)
+
 
 class ListenOnce(unittest.TestCase):
     """App mode (desktop app Code tab): listen_once with a fake recorder + transcriber.
@@ -432,7 +456,7 @@ class ListenOnce(unittest.TestCase):
         vl.listener_running = lambda: False
         self.cfg = dict(vl.DEFAULTS)
 
-    def run_once(self, steps, wake=False, timeout=5):
+    def run_once(self, steps, wake=False, timeout=5, sid=""):
         it = iter(steps)
         self.current = ""
 
@@ -443,7 +467,8 @@ class ListenOnce(unittest.TestCase):
                 return "timeout"
             return status
 
-        return vl.listen_once(self.cfg, timeout, wake=wake, rec=rec, stt=lambda c, w: self.current)
+        return vl.listen_once(self.cfg, timeout, wake=wake, rec=rec, stt=lambda c, w: self.current,
+                              claude_sid=sid)
 
     def test_returns_first_usable_utterance(self):
         r = self.run_once([("ok", ""), ("ok", "What time is it?")])
@@ -460,6 +485,15 @@ class ListenOnce(unittest.TestCase):
     def test_wake_mode_follow_up_window_after_a_spoken_reply(self):
         vl.LAST_SPOKEN().write_text("reply")          # a reply was just spoken
         r = self.run_once([("ok", "Yes, go ahead.")], wake=True)
+        self.assertEqual(r["heard"], "Yes, go ahead.")
+
+    def test_follow_up_window_only_for_own_sessions_reply(self):
+        vl.LAST_SPOKEN().write_text("another session's reply")
+        vl.spoke_file("other-session").write_text("")
+        r = self.run_once([("ok", "Yes, go ahead.")], wake=True, sid="my-session")
+        self.assertEqual(r["status"], "timeout")     # not addressed, and no reply of OURS just now
+        vl.spoke_file("my-session").write_text("")
+        r = self.run_once([("ok", "Yes, go ahead.")], wake=True, sid="my-session")
         self.assertEqual(r["heard"], "Yes, go ahead.")
 
     def test_unfinished_sentence_is_joined(self):

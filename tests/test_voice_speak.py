@@ -161,6 +161,14 @@ class HookMode(unittest.TestCase):
         self.assertSilentExit0(r)
         self.assertTrue(self.last.read_text().startswith("It worked."))
 
+    def test_marks_which_session_spoke(self):
+        """The listener waits for ITS session's reply, not any reply (claude-voice.spoke.<sid>)."""
+        (Path(self.env["CLAUDE_VOICE_DIR"]) / "enabled").touch()
+        self.run_hook(json.dumps(self.payload))
+        mark = Path(self.env["TMPDIR"]) / f"claude-voice.spoke.{self.payload['session_id']}"
+        self.assertTrue(mark.exists())
+        self.assertEqual(mark.read_text(), "", "the marker holds no reply text")
+
     def test_session_flag_speaks_only_that_session(self):
         (Path(self.env["TMPDIR"]) / f"claude-voice.{self.payload['session_id']}").touch()
         self.run_hook(json.dumps(self.payload))

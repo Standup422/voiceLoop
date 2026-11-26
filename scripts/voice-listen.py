@@ -48,7 +48,8 @@
 #          Safety: stops after idle_minutes with nothing sent, and checks before EVERY
 #          send that Claude still runs in the pane (otherwise speech would hit zsh).
 #          Log: $TMPDIR/claude-listen.log. Lessons: [[A voice loop for Claude Code]], [[One mic, many sessions — routing voice to Claude panes]],
-#          [[Whisper invents words from silence]], [[Hands-free speech-to-text with whisper.cpp]].
+#          [[Whisper invents words from silence]], [[Hands-free speech-to-text with whisper.cpp]],
+#          [[Benchmarking speech-to-text without a microphone]].
 
 from __future__ import annotations
 
@@ -159,6 +160,12 @@ def take_control():
     return ("switch", m.group(1)) if m else None
 LAST_SPOKEN = lambda: tmp_dir() / "claude-voice.last.txt"  # written by voice-speak.py
 SPEAK_PID = lambda: tmp_dir() / "claude-voice.pid"         # written by voice-speak.py
+
+
+def spoke_file(claude_sid: str = "") -> Path:
+    """Touched by voice-speak.py when THIS session's reply starts speaking. Without a session
+    id, fall back to the shared last-spoken file (any session's reply counts)."""
+    return tmp_dir() / f"claude-voice.spoke.{claude_sid}" if claude_sid else LAST_SPOKEN()
 
 
 def load_config() -> dict:
@@ -494,8 +501,9 @@ def speech_on(claude_sid: str) -> bool:
 
 def wait_for_reply(cfg: dict, sent_at: float, claude_sid: str = "") -> None:
     """Half-duplex: keep the mic closed until Claude's reply has been spoken.
-    voice-speak.py rewrites LAST_SPOKEN when it starts speaking; then we wait
-    for its `say` process to exit."""
+    voice-speak.py touches spoke_file(<session>) when it starts speaking that session's
+    reply; then we wait for the speech process to exit. Per session since 2026-11-25:
+    with one shared file, ANOTHER voiced session's reply ended this wait early."""
     deadline = time.time() + float(cfg["reply_timeout"])
     while time.time() < deadline:
         if not speech_on(claude_sid):
@@ -504,7 +512,7 @@ def wait_for_reply(cfg: dict, sent_at: float, claude_sid: str = "") -> None:
             log("control request pending; stopped waiting for the reply")
             return   # a switch/stop request (CLI or dashboard) beats waiting for an old reply
         try:
-            if LAST_SPOKEN().stat().st_mtime > sent_at:
+            if spoke_file(claude_sid).stat().st_mtime > sent_at:
                 break
         except OSError:
             pass
@@ -702,7 +710,7 @@ def listener_running() -> bool:
 
 
 def listen_once(cfg: dict, timeout: float, wake: bool = False, cwd: str = "",
-                rec=None, stt=None) -> dict:
+                rec=None, stt=None, claude_sid: str = "") -> dict:
     """App mode (Claude desktop app, Code tab). There is no pane to type into, so the
     session runs this as a background command and gets woken with the result: record
     until ONE usable utterance or `timeout` seconds. Keeps listening (never returns)
@@ -721,8 +729,8 @@ def listen_once(cfg: dict, timeout: float, wake: bool = False, cwd: str = "",
     ecfg = effective(cfg, cwd)
     gate = Gate(wake, float(cfg["follow_up_seconds"]), stop=lambda t: is_stop(t, cfg),
                 extra_wake=cfg.get("wake_words") or ())
-    try:   # a reply spoken just now opens the follow-up window, as in the loop
-        spoke_at = LAST_SPOKEN().stat().st_mtime
+    try:   # OUR reply spoken just now opens the follow-up window, as in the loop
+        spoke_at = spoke_file(claude_sid).stat().st_mtime
         if time.time() - spoke_at < gate.follow:
             gate.replied(spoke_at)
     except OSError:
@@ -1418,7 +1426,8 @@ def main() -> int:
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
     if a.once:
         timeout = a.timeout if a.timeout is not None else float(cfg["idle_minutes"]) * 60
-        res = listen_once(cfg, timeout, wake=a.wake or bool(cfg["wake"]), cwd=os.getcwd())
+        res = listen_once(cfg, timeout, wake=a.wake or bool(cfg["wake"]), cwd=os.getcwd(),
+                          claude_sid=re.sub(r"[^A-Za-z0-9-]", "", a.claude_session))
         print(json.dumps(res) if a.json else f"{res['status']}: {res['heard']}")
         return 1 if res["status"] in ("busy", "fail") else 0
     if not a.iterm_session:

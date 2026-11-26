@@ -35,7 +35,10 @@ The installer:
 - installs the tools it needs (whisper-cpp, sox, uv, jq);
 - copies the scripts into `~/.claude/hooks/` and the `voice` command into `~/.local/bin/`;
 - adds the slash commands `/voice-loop` and `/voice-app`;
-- downloads the speech models and checks each one's checksum;
+- downloads the speech models (about 1 GB) and checks each one's checksum. Setting up several
+  Macs? Put the models on a network share once, laid out like `~/.local/share/voiceloop`
+  (`models/`, `kokoro/`), and run `VOICELOOP_MIRROR=/path/to/that/folder ./install.sh`: it copies
+  from there instead and still checks every checksum;
 - **listens to your room for 2 seconds** (stay quiet) to set the mic sensitivity;
 - writes a default config and **runs its own tests**.
 

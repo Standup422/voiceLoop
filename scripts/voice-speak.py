@@ -299,10 +299,12 @@ def stop_speech() -> bool:
     return killed
 
 
-def speak(text: str, cfg: dict) -> None:
+def speak(text: str, cfg: dict, sid: str = "") -> None:
     stop_speech()                 # one voice at a time: new speech replaces old
     try:
         last_file().write_text(text)
+        if sid:   # tells THIS session's listener its reply has started (no text in it)
+            (tmp_dir() / f"claude-voice.spoke.{sid}").write_text("")
     except OSError:
         pass
     if not text or cfg.get("engine") == "none":
@@ -397,7 +399,7 @@ def hook_main(dry_run: bool = False) -> None:
     if dry_run:
         print(text)
     elif text:
-        speak(text, cfg)
+        speak(text, cfg, sid)
 
 
 # --- CLI mode -----------------------------------------------------------------
