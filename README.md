@@ -56,8 +56,9 @@ cd ~/Projects/voiceLoop && ./install.sh
 The installer installs its tools (whisper-cpp, sox, uv, jq), puts the scripts in `~/.claude/hooks/`,
 downloads and checksums the models, writes a default config and runs the test suite. It **never
 edits your Claude Code settings**. Instead it prepares the change and prints the command to apply it.
-Then give iTerm and/or Claude **Microphone** permission, relaunch the app, and run **`voice setup`**.
-It checks the mic, learns how Whisper hears you say "Claude", and walks through the settings.
+Then type **`/voice-setup`** in a Claude session: a page in your browser shows what is still missing,
+lets you say a first sentence and hear the answer, and offers optional fine-tuning (about 2 minutes).
+`voice setup` is the same as a text wizard in the terminal.
 Full walkthrough and troubleshooting: **[docs/INSTALL.md](docs/INSTALL.md)**.
 
 Then, in a Claude Code session:

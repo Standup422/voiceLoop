@@ -7,6 +7,7 @@
 | `scripts/voice-speak.py` | **The mouth** + the `voice` command. Registered as Claude Code's `Stop`, `UserPromptSubmit` and `Notification` hooks. |
 | `scripts/voice-listen.py` | **The ears.** Records, transcribes, decides what to send, and sends it. |
 | `scripts/voice-kokoro.py` | Neural voice (Kokoro), sentence by sentence. Falls back to macOS `say`. |
+| `scripts/voice-setup.py` | **The setup page** (`/voice-setup`, `voice setup web`): check, say something, done. The page is the display; the recording happens on the Mac, with the same microphone permission the voice loop uses. |
 | `commands/voice-app.md` | The `/voice-app` slash command (desktop app mode). |
 | `install.sh` | Idempotent installer and self-check (`--check`). |
 

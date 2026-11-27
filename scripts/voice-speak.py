@@ -17,6 +17,7 @@
 #          CLI:    voice on | off | session [on|off] | stop | status | test [text]
 #                  voice listen [on|wake|off|status|switch <project>|once [--wake --json]]
 #                  voice setup   (interactive first-run wizard: mic, wake word, settings)
+#                  voice setup web   (the same as a page in the browser: voice-setup.py)
 #                  voice words [add X | fix heard = Right | remove X]   (Whisper word list)
 #                  voice benchmark [--models base,small] [--noise] [--quick] [--show]   (no mic)
 #          Debug:  voice-speak.py --dry-run < payload.json   # print cleaned text only
@@ -888,9 +889,13 @@ def cli(args: list) -> int:
     elif cmd == "benchmark":   # Whisper scoring; lives in voice-listen.py (it owns transcribe)
         script = Path(__file__).resolve().parent / "voice-listen.py"
         os.execv(str(script), [str(script), "--benchmark", *args[1:]])
+    elif cmd == "setup" and args[1:2] == ["web"]:   # the same setup as a page in the browser (voice-setup.py)
+        script = Path(__file__).resolve().parent / "voice-setup.py"
+        os.execv(str(script), [str(script), *args[2:]])
     elif cmd == "setup":   # interactive wizard; lives in voice-listen.py (it owns the mic code)
         if any(x in ("-h", "--help", "help") for x in args[1:]):
-            print("voice setup: interactive first-run wizard, about 3 minutes. Run it in a terminal\n"
+            print("voice setup web: the same setup as a page in your browser (about 2 minutes).\n"
+                  "voice setup: interactive first-run wizard, about 3 minutes. Run it in a terminal\n"
                   "window. Steps: mic check + level meter, room noise, wake-word training (say\n"
                   "\"Claude\" 5 times), a speak-and-hear test, the main settings, a cheat sheet.\n"
                   "Nothing is saved without a yes; ~/.claude/voice/config.json is backed up first.")

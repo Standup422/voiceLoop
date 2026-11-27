@@ -71,12 +71,12 @@ step "2. Scripts -> $HOOKS"
 SRC=$HERE/scripts; where="this repo"
 if [[ -n $DEV_SRC && -f "$DEV_SRC/voice-speak.py" ]]; then
   SRC=$DEV_SRC; where="the developer source"
-  for f in voice-speak.py voice-listen.py voice-kokoro.py voice-talk.py; do   # the repo copy is what others install
+  for f in voice-speak.py voice-listen.py voice-kokoro.py voice-talk.py voice-setup.py; do   # the repo copy is what others install
     cmp -s "$SRC/$f" "$HERE/scripts/$f" || fail "scripts/$f differs from $SRC: cp -p \"$SRC/$f\" scripts/ and commit"
   done
 fi
 do_ mkdir -p "$HOOKS" 2>/dev/null
-for f in voice-speak.py voice-listen.py voice-kokoro.py voice-talk.py; do
+for f in voice-speak.py voice-listen.py voice-kokoro.py voice-talk.py voice-setup.py; do
   if [[ -f "$SRC/$f" ]] && ! cmp -s "$SRC/$f" "$HOOKS/$f"; then
     if do_ cp -p "$SRC/$f" "$HOOKS/$f" && chmod +x "$HOOKS/$f"; then pass "$f (copied from $where)"
     elif [[ -e "$HOOKS/$f" ]]; then fail "$f differs from the copy in $where"
@@ -217,7 +217,7 @@ fi
 step "7. Self-test"
 tlog=$(mktemp -t voiceloop-tests)
 # Test the INSTALLED copies (proves what will actually run).
-if VOICE_SPEAK=$HOOKS/voice-speak.py VOICE_LISTEN=$HOOKS/voice-listen.py VOICE_KOKORO=$HOOKS/voice-kokoro.py VOICE_TALK=$HOOKS/voice-talk.py \
+if VOICE_SPEAK=$HOOKS/voice-speak.py VOICE_LISTEN=$HOOKS/voice-listen.py VOICE_KOKORO=$HOOKS/voice-kokoro.py VOICE_TALK=$HOOKS/voice-talk.py VOICE_SETUP=$HOOKS/voice-setup.py \
    python3 -m unittest discover -s "$HERE/tests" >"$tlog" 2>&1; then
   pass "test suite: $(grep -Eo 'Ran [0-9]+ tests' "$tlog")"
 else fail "test suite failed:"; tail -15 "$tlog" | sed 's/^/        /'; fi
@@ -234,12 +234,14 @@ fi
 
 todo+=("Microphone permission: each app that records needs it (iTerm, Terminal, and/or the Claude app)
         in System Settings > Privacy & Security > Microphone, then a RELAUNCH of that app.
-        Without it the mic records silence and macOS never asks. Claude-app-only? Run \`voice setup\`
-        in the app's Terminal panel: it uses the Claude app's permission.")
+        Without it the mic records silence and macOS never asks. The setup page (/voice-setup)
+        tests exactly this and opens the right settings pane.")
 todo+=("iTerm conversation mode also needs Automation permission for iTerm (asked on first send).")
 
 printf '\n\033[1mResult: %d ok, %d need attention\033[0m\n' "$ok" "$bad"
 printf '\nStill for you:\n'; for t in "${todo[@]}"; do printf '  - %s\n' "$t"; done
-printf '\nNext: run `voice setup` in a terminal tab (mic check, wake-word training, settings).\n'
+printf '\nNext: type /voice-setup in a Claude session (or run `voice setup web`): a page in your browser\n'
+printf '      checks what is missing and lets you say a first sentence. About 2 minutes.\n'
+printf '      Prefer a terminal? `voice setup` is the same as a text wizard.\n'
 printf 'Then: in iTerm, `voice session` + `voice listen wake`; in the Claude app, /voice-app.\n'
 (( bad == 0 ))

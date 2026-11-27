@@ -80,9 +80,23 @@ it on for every app you'll talk through (**iTerm**, **Terminal** and/or **Claude
 **d) (iTerm only)** The first time voiceLoop types into your Claude session, macOS asks to let it
 control iTerm (Automation). Click **OK**.
 
-**e) Run the setup wizard** in a terminal window (not inside a Claude session: it needs your
-keyboard). The terminal app needs Microphone permission too. **Using only the Claude app?**
-Open its **Terminal panel** and run it there: it uses the Claude app's permission.
+**e) Run the setup page.** In a Claude session type **`/voice-setup`** (or run `voice setup web`
+in a terminal). A page opens in your browser. About 2 minutes:
+1. **Ready?** It shows only what is missing. If the hooks from step a) aren't registered yet,
+   one button adds them (it shows what it adds and keeps a backup).
+2. **Say something.** Press Start, say a sentence, watch the level bar, read what it understood
+   and hear the voice answer. If the microphone gives pure silence, the page says so and opens
+   the right settings pane for you (step c).
+3. **Done**, with the two lines on how to start. **Fine-tune** is optional: pick a microphone,
+   teach it how you say "Claude", change the main settings.
+
+The page is only the display: the recording happens on your Mac, through the app you started it
+from, so the test uses the same microphone permission that talking will use. It answers on this
+computer only, and nothing is saved until you press Finish.
+
+**Prefer a terminal?** The same steps as a text wizard, in a terminal window (not inside a
+Claude session: it needs your keyboard). Using only the Claude app? Open its **Terminal panel**
+and run it there.
 ```bash
 voice setup
 ```
