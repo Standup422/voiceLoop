@@ -143,6 +143,9 @@ are only here for explanation: the real file is plain JSON.)
     "wake_words": [],         // extra spellings of "Claude", learned by `voice setup`
     "commands": {"clear": {"confirm": true, "reply": false}, "compact": {"reply": false}},
     "idle_minutes": 20,       // mic off after this long with nothing sent
+    "quiet_threshold": "",    // threshold while `voice quiet on` ("" = 0.6 x threshold)
+    "snippets": {},           // say "snippet <name>" to send the stored text
+    "log_hours": 24,          // the log of what you said is set aside after this long, then deleted (0 = keep)
     "prompt": "Claude, Claude Code, iTerm, GitHub, …",   // vocabulary hint for Whisper
     "replacements": {"claude code": "Claude Code"},     // spelling fixes, applied after
     "sounds": {"listening": "Tink", "accepted": "Purr", "ready": "", "stopped": "Basso"},
@@ -176,6 +179,34 @@ words first, then your list, then the config's `prompt`. `voice words` warns whe
 [`examples/voice.json`](../examples/voice.json)). When the listener targets that project, its
 words go first in Whisper's prompt and its replacements win. It's re-read on every utterance.
 
+**Vocabulary from the project itself:** `voice words scan` (in a project folder, or
+`voice words scan <folder>`) collects the names Whisper is likely to spell wrong: the folder
+name, file names, names defined in the code (`def`, `class`, `function`, `const` …) and words
+in the docs that no dictionary knows. It keeps mixed-case names (`useEffect`) and unknown words
+(`Kokoro`), skips tests, `node_modules` and hidden folders, and writes at most 300 characters
+of them to `.claude/voice.json` as `"scanned"`. Your own `"vocabulary"` there is never touched
+and comes first. `--dry` only shows the list. It is a rule of thumb, not a judgement: remove
+names you never say, and scan again after big changes.
+
+**Spoken snippets:** store a text once, then say **"snippet *name*"** to send it:
+
+```bash
+voice snippets add standup = Summarise what changed in this project since yesterday.
+voice snippets                       # list them
+voice snippets remove standup
+```
+
+"Claude, snippet standup" sends the text; it can also sit inside a sentence. The word "snippet"
+is required, so a name that is an ordinary word never fires by accident. A project can carry its
+own in `.claude/voice.json` (`"snippets": {"name": "text"}`); they win over yours. A snippet is
+sent as one line and, like all speech, can never start a shell or slash command.
+
+**A soft voice:** `voice quiet on` lowers the mic threshold (to 0.6 × the normal one, or to
+`quiet_threshold` if you set it) for talking quietly; `voice quiet off` restores it. It applies
+from the next recording, with no restart. If a recording never ends, the room is louder than the
+quiet threshold: set `quiet_threshold` a little higher. Whisper is less accurate on very soft
+speech, so try it with your own voice first.
+
 **Benchmark, no microphone:** `voice benchmark` has macOS `say` speak known sentences into WAV
 files (the built-in ones plus one per word in your vocabulary; with Kokoro installed, two of its
 neural voices read them too, `kokoro:af_heart` and `kokoro:bm_george`), runs every installed Whisper
@@ -197,6 +228,51 @@ the words Whisper got wrong: add those with `voice words add`. Options: `--model
 (every wrong sentence, said vs heard), `--json`. Computer voices are cleaner than a person in a
 room, so use it to compare models and find missing words, not as your own accuracy.
 
+## The Talk page: a browser or a phone as microphone and speaker
+
+`voice talk` (or `/voice-talk` in a session) starts a small web server, `voice-talk.py`. Its page
+streams the microphone to the Mac; the Mac runs the audio through the **same** endpointing,
+Whisper, word list and gate as the desk listener, and delivers the text into the Claude session
+that is active at the desk. The reply comes back as sound, one sentence at a time.
+
+```
+page: mic -> 16 kHz PCM, a chunk every 200 ms  --POST-->  voice-talk.py -> Whisper -> gate
+page: plays the reply                          <--WAVs--  reply text from the Stop hook -> Kokoro / say
+page: state, what was heard                    <--events- (server-sent events)
+```
+
+- **Two doors.** `http://localhost:8445/` for a browser on the Mac (always). `https://<mac>.local:8444/`
+  for phones, only after `voice talk setup` has made a certificate. A phone's browser gives a page
+  the microphone only over HTTPS it trusts, so the phone must trust your Mac's own certificate
+  authority (`voice talk ca` shows how).
+- **Pairing.** `voice talk pair` shows a QR code with a one-time secret (10 minutes, one phone).
+  The phone trades it for a long random token in a cookie. Only hashes are stored on the Mac
+  (`~/.local/share/voiceloop/talk/phones.json`). From the network, nothing but a text-free status
+  is served without the token. `voice talk unpair <name>` ends a phone's access at once.
+- **Which session.** First match: the session the desk listener points at; a session waiting in
+  `voice listen once`; else the session that replied last. Once a conversation has a session it
+  stays there (the page shows "Talking to: <project>"). `--project <name>` picks the start.
+- **Delivery.** Into an iTerm pane the text is typed, after the same "is Claude still running
+  there?" check as at the desk. A session in app mode gets it through `voice listen once`.
+- **The reply.** For a turn that came from the page, the Stop hook hands the reply text to the
+  Talk server and stays quiet on the Mac. If the page has gone, the Mac speaks it: a reply is
+  never dropped.
+- **One microphone at a time.** While a page streams, the desk microphone rests. With several
+  pages open, the one tapped last talks.
+- **Half-duplex.** The page doesn't listen while Claude works or while the reply plays.
+- **Settings:** `"talk": {"port": 8445, "tls_port": 8444, "threshold": ""}` in `config.json`
+  (`threshold`: the phone is a different microphone, so it can have its own).
+
+Security notes for the Talk page:
+
+- A paired phone can type into a live Claude session. That is the feature, and the reason for
+  pairing and HTTPS. Permission prompts still appear on the Mac.
+- Requests are checked against the `Host` and `Origin` headers, so a web page open in another
+  browser tab can't post audio to the server on `localhost`.
+- The certificate authority's key (`mkcert -CAROOT`) can vouch for any site to a phone that
+  trusts it. It never leaves your Mac; every user makes their own.
+- No audio is kept. Heard text goes to the page and the local log, never to `/api/status`.
+
 ## Security model
 
 - **Anyone within earshot can talk to Claude** while the listener runs: a person, or a video
@@ -204,7 +280,10 @@ room, so use it to compare models and find missing words, not as your own accura
   permission-bypass modes. voiceLoop types messages, and doesn't grant anything a typed message
   wouldn't get, so Claude Code's permission prompts remain your safety net.
 - What you say is logged in plain text to `$TMPDIR/claude-listen.log` (your user's temp folder) for
-  troubleshooting. The `voice status --json` output deliberately contains no text.
+  troubleshooting. After `log_hours` (24) the log is set aside as `claude-listen.log.old`, and
+  that file is deleted a further 24 hours after its last line, so text is kept for two days at
+  most (`"log_hours": 0` keeps everything). The `voice status --json` output deliberately
+  contains no text.
 - Leading `!`, `/` and `#` are stripped, also after the wake word ("Claude, /clear" sends
   "clear"), so speech can't become a shell command, slash command or memory note.
 - Before **every** send (and every 60 s while idle) the listener checks that Claude is still running

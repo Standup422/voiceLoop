@@ -32,6 +32,10 @@ the transcribed text goes to Claude, exactly as if you'd typed it. (Claude Code'
 - **A word list** (`voice words add …`) plus per-project vocabulary, so Whisper spells your names
   and terms right. `voice benchmark` checks it without a microphone: the Mac speaks test
   sentences, and each Whisper model is scored with the word list off and on.
+- **Project names, snippets, a soft voice:** `voice words scan` collects a project's own names
+  for Whisper; "snippet *name*" sends a text you stored; `voice quiet on` is for talking quietly.
+- **From your phone (optional):** a page on a paired phone becomes the microphone and speaker of
+  the session on your Mac, over your own network (`/voice-talk`). Off until you start it.
 - **Safety:** speech can't become a shell or slash command; nothing is typed into a pane where Claude
   isn't running; the mic turns off after 20 quiet minutes.
 - **One-command, self-testing install** that measures your room's noise to set the mic sensitivity.
@@ -84,7 +88,8 @@ Details, settings and the security model: **[docs/HOW-IT-WORKS.md](docs/HOW-IT-W
 ## Privacy
 
 Audio is recorded to a temporary file, transcribed on the Mac and deleted. The transcribed text is
-also written to a local log (`$TMPDIR/claude-listen.log`) for troubleshooting. Downloads happen once:
+also written to a local log (`$TMPDIR/claude-listen.log`) for troubleshooting, which is deleted
+within two days. Downloads happen once:
 the models (Hugging Face, GitHub) at install, and the voice's Python packages (PyPI) on first use.
 After that, speech recognition and the voice run offline. What leaves the Mac is what Claude Code
 already sends: your messages, now typed by voice.

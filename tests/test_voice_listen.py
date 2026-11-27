@@ -11,6 +11,7 @@ import wave
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 import unittest
 import unittest.mock
@@ -295,13 +296,33 @@ class MicDevice(unittest.TestCase):
             def wait(self):
                 return self.returncode
 
+        warned, logged = [], []
         with unittest.mock.patch.object(vl.subprocess, "Popen", Proc), \
-             unittest.mock.patch.object(vl, "speaking", lambda: False):
+             unittest.mock.patch.object(vl, "speaking", lambda: False), \
+             unittest.mock.patch.object(vl, "log", logged.append), \
+             unittest.mock.patch.object(vl, "warn_missing_mic", warned.append):
             r = vl.record({**CFG, "device": "Webcam Mic"}, os.path.join(tempfile.gettempdir(), "x.wav"))
         self.assertEqual(r, "fail")                    # the default gave nothing either
+        self.assertEqual(warned, ["Webcam Mic"])       # the user is told (spoken, throttled)
+        self.assertEqual(len(logged), 1)
         self.assertEqual(len(calls), 2)                # tried the chosen mic, then the default once
         self.assertIn("coreaudio", calls[0])
         self.assertEqual(calls[1][0], "rec")
+
+    def test_missing_mic_notice_is_throttled(self):
+        """App mode starts a new process per utterance: the notice must not repeat each time."""
+        self.assertTrue(vl.should_warn(0.0, 1000.0))                 # never warned
+        self.assertFalse(vl.should_warn(1000.0, 1000.0 + 30))        # warned 30 s ago
+        self.assertTrue(vl.should_warn(1000.0, 1000.0 + vl.MIC_WARN_EVERY))
+        said = []
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        with unittest.mock.patch.object(vl, "tmp_dir", lambda: Path(d.name)), \
+             unittest.mock.patch.object(vl, "say_local", said.append):
+            vl.warn_missing_mic("Webcam Mic")
+            vl.warn_missing_mic("Webcam Mic")
+        self.assertEqual(len(said), 1)
+        self.assertIn("Webcam Mic", said[0])
 
     def test_device_setting_loads(self):
         d = tempfile.TemporaryDirectory()
@@ -394,7 +415,7 @@ class SetupWizard(unittest.TestCase):
                          ("send", "what's next?"))
 
     def test_setup_refuses_without_a_keyboard(self):
-        # gallifrey 2026-11-25: piped, it took every default and recorded from the mic
+        # found 2026-11-25 on a second Mac: piped, it took every default and recorded from the mic
         r = subprocess.run([sys.executable, str(SCRIPT), "--setup"], stdin=subprocess.DEVNULL,
                            capture_output=True, text=True, timeout=30)
         self.assertEqual(r.returncode, 2)
@@ -622,6 +643,82 @@ class ListenOnce(unittest.TestCase):
     def test_busy_when_the_iterm_loop_owns_the_mic(self):
         vl.listener_running = lambda: True
         self.assertEqual(self.run_once([("ok", "hello")])["status"], "busy")
+
+
+class PhoneInbox(ListenOnce):
+    """The Talk page (voice-talk.py) as a second source for `listen once`."""
+
+    def test_phone_live_follows_the_markers_age(self):
+        self.assertFalse(vl.phone_live())
+        vl.TALK_LIVE().touch()
+        self.assertTrue(vl.phone_live())
+        old = time.time() - 10
+        os.utime(vl.TALK_LIVE(), (old, old))
+        self.assertFalse(vl.phone_live())                 # a crashed server can't mute the desk
+
+    def test_inbox_round_trip_is_read_once(self):
+        vl.put_inbox("s1", {"status": "heard", "heard": "Open the settings file."})
+        self.assertEqual(vl.take_inbox("s1"), {"status": "heard", "heard": "Open the settings file.", "via": "phone"})
+        self.assertIsNone(vl.take_inbox("s1"))
+
+    def test_inbox_text_is_defanged_and_checked(self):
+        vl.put_inbox("s1", {"status": "heard", "heard": "! /clear\nnow"})
+        self.assertEqual(vl.take_inbox("s1")["heard"], "clear now")
+        for bad in ({"status": "stop", "heard": "x"}, {"status": "heard", "heard": "  "}, ["heard"],
+                    {"status": "command", "heard": "x", "command": "../../x"}):
+            vl.put_inbox("s1", bad)
+            self.assertIsNone(vl.take_inbox("s1"), bad)
+        vl.inbox_file("s1").write_text("{not json")
+        self.assertIsNone(vl.take_inbox("s1"))
+        self.assertFalse(vl.inbox_file("s1").exists())
+
+    def test_phone_utterance_is_returned_without_recording(self):
+        vl.put_inbox("s1", {"status": "heard", "heard": "From the couch."})
+        r = self.run_once([("ok", "From the desk.")], sid="s1")
+        self.assertEqual(r, {"status": "heard", "heard": "From the couch.", "via": "phone"})
+
+    def test_phone_command_keeps_its_name(self):
+        vl.put_inbox("s1", {"status": "command", "heard": "Command wrap session.", "command": "wrap-session"})
+        self.assertEqual(self.run_once([], sid="s1")["command"], "wrap-session")
+
+    def test_another_sessions_inbox_is_left_alone(self):
+        vl.put_inbox("s2", {"status": "heard", "heard": "For someone else."})
+        self.assertEqual(self.run_once([("ok", "From the desk.")], sid="s1")["heard"], "From the desk.")
+        self.assertTrue(vl.inbox_file("s2").exists())
+
+    def test_waiting_marker_exists_only_while_listening(self):
+        seen = []
+
+        def rec(cfg, wav, deadline=0.0):
+            seen.append(vl.waiting_sessions())
+            return "timeout"
+        vl.listen_once(self.cfg, 5, wake=True, cwd="/p/gamma", rec=rec, stt=lambda c, w: "", claude_sid="s1")
+        self.assertEqual([(w["claude_session"], w["cwd"], w["wake"]) for w in seen[0]], [("s1", "/p/gamma", True)])
+        self.assertEqual(vl.waiting_sessions(), [])
+
+    def test_marker_of_a_dead_process_is_removed(self):
+        vl.once_file("gone").write_text(json.dumps({"pid": 2 ** 22 + 12345, "cwd": "/p", "wake": False, "ts": 1}))
+        self.assertEqual(vl.waiting_sessions(), [])
+        self.assertFalse(vl.once_file("gone").exists())
+
+    def test_mic_stays_closed_while_the_phone_streams(self):
+        vl.TALK_LIVE().touch()
+        calls = []
+
+        def rec(cfg, wav, deadline=0.0):
+            calls.append(1)
+            return "timeout"
+        threading.Timer(0.4, lambda: vl.put_inbox("s1", {"status": "heard", "heard": "From the couch."})).start()
+        r = vl.listen_once(self.cfg, 5, rec=rec, stt=lambda c, w: "", claude_sid="s1")
+        self.assertEqual((r["heard"], calls), ("From the couch.", []))
+
+    def test_recording_cut_off_by_the_phone_is_not_our_reply(self):
+        """'spoke' normally opens the follow-up window; a phone take-over must not."""
+        def rec(cfg, wav, deadline=0.0):
+            vl.put_inbox("s1", {"status": "heard", "heard": "From the couch."})
+            return "spoke"
+        r = vl.listen_once(self.cfg, 5, wake=True, rec=rec, stt=lambda c, w: "", claude_sid="s1")
+        self.assertEqual(r["heard"], "From the couch.")
 
 
 class Benchmark(unittest.TestCase):
@@ -921,6 +1018,207 @@ class Pipeline(unittest.TestCase):
     def test_silence_transcribes_to_nothing(self):
         subprocess.run(["sox", "-n", "-r", "16000", "-c", "1", "-b", "16", self.p("s.wav"), "trim", "0", "4"], check=True)
         self.assertEqual(vl.clean(vl.transcribe(CFG, self.p("s.wav")), CFG), "")
+
+
+class _VoiceDir(unittest.TestCase):
+    """A private ~/.claude/voice and $TMPDIR for each test."""
+
+    def setUp(self):
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        self.dir = Path(d.name)
+        saved = (vl.voice_dir, vl.tmp_dir)
+        self.addCleanup(lambda: (setattr(vl, "voice_dir", saved[0]), setattr(vl, "tmp_dir", saved[1])))
+        vl.voice_dir = lambda: self.dir
+        vl.tmp_dir = lambda: self.dir
+
+    def run_cli(self, fn, args):
+        out, err = io.StringIO(), io.StringIO()
+        with unittest.mock.patch("sys.stdout", out), unittest.mock.patch("sys.stderr", err):
+            code = fn(args)
+        return code, out.getvalue() + err.getvalue()
+
+
+class Snippets(_VoiceDir):
+    """ "snippet <name>" becomes the stored text."""
+    S = {"standup": "Summarise what changed since yesterday.", "standup long": "The long one.",
+         "risky": "/clear\nand !rm"}
+
+    def c(self, s, snippets=None):
+        return vl.clean(s, {**CFG, "snippets": self.S if snippets is None else snippets})
+
+    def test_expands_with_whispers_punctuation(self):
+        for said in ["snippet standup", "Snippet, standup.", "snippet: Standup", "Snippet - standup"]:
+            self.assertTrue(self.c(said).startswith("Summarise what changed since yesterday."), said)
+        self.assertEqual(self.c("Claude, snippet standup and be brief"),
+                         "Claude, Summarise what changed since yesterday. and be brief")
+
+    def test_needs_the_word_snippet_and_a_whole_name(self):
+        self.assertEqual(self.c("the standup went well"), "the standup went well")
+        self.assertEqual(self.c("snippet standups"), "snippet standups")
+        self.assertEqual(self.c("snippet unknown"), "snippet unknown")
+
+    def test_longest_name_first_and_hyphen(self):
+        self.assertEqual(self.c("snippet standup long"), "The long one.")
+        self.assertEqual(self.c("snippet stand-up", {"stand up": "ok then"}), "ok then")
+
+    def test_a_snippet_cannot_become_a_command_or_send_early(self):
+        self.assertEqual(self.c("snippet risky"), "clear and !rm")           # one line, no leading /
+        self.assertEqual(vl.Gate(True, 30).feed(self.c("Claude, snippet risky"), 0), ("send", "clear and !rm"))
+
+    def test_bad_settings_are_ignored(self):
+        self.assertEqual(self.c("snippet standup", "nonsense"), "snippet standup")
+        self.assertEqual(self.c("snippet a", {"a": 5, "": "x", 3: "y"}), "snippet a")
+
+    def test_project_snippets_win(self):
+        cwd = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, cwd)
+        (Path(cwd) / ".claude").mkdir()
+        (Path(cwd) / ".claude" / "voice.json").write_text(json.dumps({"snippets": {"standup": "Project one."}}))
+        e = vl.effective({**CFG, "snippets": self.S}, cwd)
+        self.assertEqual(vl.clean("snippet standup", e), "Project one.")
+        self.assertEqual(vl.clean("snippet standup long", e), "The long one.")
+
+    def test_cli(self):
+        code, out = self.run_cli(vl.snippets_cli, ["add", "Stand", "Up", "=", "Tell", "me = what changed"])
+        self.assertEqual(code, 0)
+        self.assertEqual(vl.load_config()["snippets"], {"stand up": "Tell me = what changed"})
+        self.assertEqual(self.run_cli(vl.snippets_cli, ["remove", "nope"])[0], 1)
+        self.assertEqual(self.run_cli(vl.snippets_cli, ["remove", "stand up"])[0], 0)
+        self.assertEqual(vl.load_config()["snippets"], {})
+        self.assertEqual(self.run_cli(vl.snippets_cli, ["add", "= text"])[0], 2)
+        self.assertEqual(self.run_cli(vl.snippets_cli, ["bogus"])[0], 2)
+
+
+class QuietMode(_VoiceDir):
+    """`voice quiet on`: a lower threshold, from the next recording."""
+
+    def test_factor_and_own_value(self):
+        cfg = {**CFG, "threshold": "1.0%"}
+        self.assertAlmostEqual(vl._threshold(cfg), 0.01)
+        self.assertEqual(self.run_cli(vl.quiet_cli, ["on"])[0], 0)
+        self.assertAlmostEqual(vl._threshold(cfg), 0.006)
+        self.assertAlmostEqual(vl._threshold({**cfg, "quiet_threshold": "0.4%"}), 0.004)
+        self.assertAlmostEqual(vl._threshold({**cfg, "quiet_threshold": "rubbish"}), 0.006)
+        self.assertEqual(self.run_cli(vl.quiet_cli, ["off"])[0], 0)
+        self.assertAlmostEqual(vl._threshold({**cfg, "quiet_threshold": "0.4%"}), 0.01)
+        self.assertEqual(self.run_cli(vl.quiet_cli, ["off"])[0], 0)          # twice is fine
+        self.assertEqual(self.run_cli(vl.quiet_cli, ["bogus"])[0], 2)
+
+    def test_capture_uses_it(self):
+        # 0.7 % "speech" is under the normal 1 % threshold and over the quiet 0.6 %
+        import array as _a
+        soft = _a.array("h", [int(0.007 * 32768)] * vl.FRAME).tobytes()
+        still = bytes(vl.FRAME * 2)
+        cfg = {**CFG, "threshold": "1.0%", "silence_seconds": 0.3, "max_seconds": 5}
+        audio = soft * 20 + still * 20
+        self.assertEqual(vl.capture(io.BytesIO(audio), cfg)[0], "fail")       # never started: stream ended
+        self.run_cli(vl.quiet_cli, ["on"])
+        status, pcm = vl.capture(io.BytesIO(audio), cfg)
+        self.assertEqual(status, "ok")
+        self.assertGreater(len(pcm), len(soft) * 15)
+
+
+class LogRotation(_VoiceDir):
+    """The plain-text log of what was said is set aside, then deleted."""
+
+    def test_rotates_then_deletes(self):
+        log, old = vl.LOG(), vl.LOG().with_name("claude-listen.log.old")
+        log.write_text("10:00:00 heard: a secret\n")
+        now = time.time()
+        vl.rotate_log(24, now + 3600)                    # one hour old: untouched
+        self.assertTrue(log.exists() and not old.exists())
+        vl.rotate_log(24, now + 25 * 3600)               # older than a day: set aside
+        self.assertFalse(log.exists())
+        self.assertIn("a secret", old.read_text())
+        vl.rotate_log(24, now + 30 * 3600)               # .old written 30 h ago: gone
+        self.assertFalse(old.exists())
+
+    def test_zero_keeps_everything_and_missing_files_are_fine(self):
+        vl.rotate_log(24)                                # nothing there: no error
+        vl.LOG().write_text("x\n")
+        vl.rotate_log(0, time.time() + 10 ** 7)
+        self.assertTrue(vl.LOG().exists())
+
+    def test_log_checks_at_most_hourly(self):
+        calls = []
+        with unittest.mock.patch.object(vl, "rotate_log", lambda h, now=0.0: calls.append(h)), \
+             unittest.mock.patch("sys.stderr", io.StringIO()):
+            vl._LOG_CHECKED = 0.0
+            vl.log("one")
+            vl.log("two")
+        self.assertEqual(calls, [24.0])
+        self.assertEqual(len(vl.LOG().read_text().splitlines()), 2)
+
+
+class ProjectScan(_VoiceDir):
+    """`voice words scan`: a project's own names for Whisper's vocabulary hint."""
+    WORDS = {"service", "schedule", "customer", "time", "out", "file", "name", "open", "the", "and",
+             "check", "setting", "record", "stop", "report", "credit"}
+
+    def project(self):
+        root = Path(tempfile.mkdtemp()) / "wasteTrack"
+        self.addCleanup(shutil.rmtree, root.parent)
+        (root / "src").mkdir(parents=True)
+        (root / "tests").mkdir()
+        (root / "node_modules" / "zzPackage").mkdir(parents=True)
+        (root / ".git").mkdir()
+        (root / "src" / "service_schedule.py").write_text(
+            "class ServiceSchedule:\n    def customerID(self): pass\n"
+            "def open_file(): pass\ndef zephyrine_report(): pass\nTIMEOUT = 0xffe0\n")
+        (root / "tests" / "test_it.py").write_text("class ScheduleCase: pass\n")
+        (root / "node_modules" / "zzPackage" / "index.js").write_text("function leftPad() {}\n")
+        (root / ".git" / "notes.md").write_text("Gitzilla Gitzilla Gitzilla\n")
+        (root / "README.md").write_text(
+            "Open the Kokoro settings. Kokoro records. Oncely mentioned. The timeout and filename.\n"
+            "It doesn't stop. Stopped recordings. README TODO ffe ffe ffe\n")
+        return root
+
+    def test_picks_the_right_names(self):
+        root = self.project()
+        got = vl.scan_terms(root, self.WORDS)
+        self.assertEqual(got[0], "wasteTrack")                                   # the folder name leads
+        for want in ("ServiceSchedule", "customerID", "zephyrine", "Kokoro"):
+            self.assertIn(want, got)
+        for junk in ("service", "schedule", "open", "file", "timeout", "filename", "Oncely", "doesn",
+                     "Stopped", "recordings", "README", "TODO", "ffe", "ScheduleCase", "leftPad",
+                     "Gitzilla", "TIMEOUT"):
+            self.assertNotIn(junk, got, junk)
+
+    def test_limits_have_and_no_dictionary(self):
+        root = self.project()
+        self.assertNotIn("Kokoro", vl.scan_terms(root, self.WORDS, have=["kokoro"]))
+        self.assertLessEqual(len(", ".join(vl.scan_terms(root, self.WORDS, max_chars=25))), 25)
+        self.assertEqual(len(vl.scan_terms(root, self.WORDS, max_terms=2)), 2)
+        mixed = vl.scan_terms(root, set())                                       # no dictionary:
+        self.assertIn("ServiceSchedule", mixed)                                  # mixedCase only
+        self.assertNotIn("Kokoro", mixed)
+
+    def test_cli_writes_scanned_and_keeps_your_own(self):
+        root = self.project()
+        (root / ".claude").mkdir()
+        vj = root / ".claude" / "voice.json"
+        vj.write_text(json.dumps({"vocabulary": ["customerID", "Acme"], "replacements": {"a": "b"}}))
+        with unittest.mock.patch.object(vl, "load_dictionary", lambda path=None: self.WORDS):
+            code, out = self.run_cli(vl.scan_cli, [str(root), "--dry"])
+            self.assertEqual((code, json.loads(vj.read_text()).get("scanned")), (0, None))
+            code, out = self.run_cli(vl.scan_cli, [str(root)])
+        d = json.loads(vj.read_text())
+        self.assertEqual(code, 0)
+        self.assertEqual((d["vocabulary"], d["replacements"]), (["customerID", "Acme"], {"a": "b"}))
+        self.assertIn("ServiceSchedule", d["scanned"])
+        self.assertNotIn("customerID", d["scanned"])                             # already yours
+        prompt = vl.effective({**CFG, "prompt": ""}, str(root))["prompt"]
+        self.assertTrue(prompt.startswith("customerID, Acme, "))                 # yours first
+        self.assertIn("ServiceSchedule", prompt)
+
+    def test_cli_refuses_broken_json_and_a_missing_folder(self):
+        root = self.project()
+        (root / ".claude").mkdir()
+        (root / ".claude" / "voice.json").write_text("{not json")
+        self.assertEqual(self.run_cli(vl.scan_cli, [str(root)])[0], 1)
+        self.assertEqual((root / ".claude" / "voice.json").read_text(), "{not json")
+        self.assertEqual(self.run_cli(vl.scan_cli, [str(root / "nope")])[0], 2)
 
 
 if __name__ == "__main__":

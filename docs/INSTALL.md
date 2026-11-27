@@ -51,7 +51,8 @@ PyPI, and Python 3.13 if you don't have it.
 
 Options: `--whisper=base` (the 148 MB `base.en` speech model instead of `small.en`: faster and
 smaller, but more mistakes on names and jargon; for older Macs or a tight disk), `--no-kokoro` (skip the 350 MB neural voice and use the built-in macOS voice),
-`--check` (test only, change nothing), `--help`.
+`--check` (test only, change nothing; it does open the mic for 2 seconds to measure the room),
+`--no-measure` (skip that room measurement), `--help`.
 
 ## 4. The steps the installer leaves to you
 
@@ -124,6 +125,61 @@ In a Claude Code session:
 - Names it keeps getting wrong? `voice words add Zephyrine`, or `voice words fix cube control = kubectl`.
   Then `voice benchmark` (no mic needed) shows which words Whisper still misses.
 
+### From your phone (optional)
+
+A page on your phone can be the microphone and the speaker of the Claude session that is open
+on your Mac. You talk from the couch, the Mac does the work, and the answer plays on the phone.
+Nothing leaves your network. It is off until you start it.
+
+**Try it on the Mac first** (no setup needed): in a Claude session type `/voice-talk`, open
+`http://localhost:8445/` in a browser on the Mac, tap once and talk. What you say is typed into
+that session; the reply plays in the page.
+
+**Then the phone** (once per Mac, then once per phone):
+
+```bash
+brew install mkcert qrencode
+voice talk setup     # makes an HTTPS certificate for this Mac (no sudo)
+voice talk ca        # QR code + steps: the phone learns to trust this Mac
+```
+
+A phone's browser only gives a page the microphone over HTTPS it trusts, so the phone has to
+trust your Mac's own certificate authority. `ca` shows how; on an iPhone the step that counts is
+the last one (Settings > General > About > Certificate Trust Settings).
+
+Now pair the phone. Pairing is what lets it in: being on your Wi-Fi is not enough.
+
+1. In a Claude session: `/voice-talk` (starts the server), then `/voice-talk pair`.
+2. Scan the QR code with the phone within 10 minutes. It works once, for one phone.
+3. Tap once on the page, and talk. Add the page to the home screen for next time.
+
+| Command | What it does |
+|---|---|
+| `/voice-talk` | start the server for this session's project (it stops when the session ends) |
+| `/voice-talk pair` | QR code to pair one more phone |
+| `/voice-talk phones` | list paired phones |
+| `/voice-talk off` | stop the server |
+| `voice talk unpair <name>` | forget a phone at once (`all` forgets every phone) |
+
+How it behaves:
+
+- **One microphone at a time.** While a page is open and listening, the Mac's microphone rests.
+  The page you tapped last is the one that talks.
+- **It stays with one session**, shown on the page as "Talking to: <project>".
+- **Wake word:** the same as at the desk. If the session you talk to listens in wake mode, the
+  phone needs "Claude, …" too.
+- **The page must stay in front.** A phone browser stops the microphone when the page is
+  hidden or the phone locks; the page keeps the screen on while it listens. Tap once to start again.
+- **While Claude works, and while the reply plays, the page does not listen.** A beep tells
+  you it's your turn.
+- **Permission prompts appear on the Mac,** not on the phone.
+- Say "stop listening" to end it.
+
+> **Keep the certificate authority to yourself.** `mkcert -CAROOT` shows a folder with a
+> `rootCA-key.pem`. Whoever has that file can pose as any website to a phone that trusts it.
+> It never leaves your Mac: don't copy it, share it, or back it up to a shared place. Everyone
+> makes their own. To undo the trust on a phone, remove the profile there.
+
 ### Good to know
 - **Sounds:** a soft **pluck** means it's listening, a **purr** means your message was sent, and a
   **chime** means it's your turn again.
@@ -156,8 +212,8 @@ cd ~/Projects/voiceLoop && git pull && ./install.sh
 
 ```bash
 voice listen off; voice off all
-rm -f ~/.claude/hooks/voice-{speak,listen,kokoro}.py ~/.local/bin/voice \
-      ~/.claude/commands/voice-{app,loop}.md
+rm -f ~/.claude/hooks/voice-{speak,listen,kokoro,talk}.py ~/.local/bin/voice \
+      ~/.claude/commands/voice-{app,loop,talk}.md
 rm -rf ~/.local/share/voiceloop ~/.claude/voice
 ```
 Then remove the two `voice-speak.py` entries (under `Stop` and `UserPromptSubmit`) from

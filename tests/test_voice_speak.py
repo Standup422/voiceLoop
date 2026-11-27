@@ -169,6 +169,34 @@ class HookMode(unittest.TestCase):
         self.assertTrue(mark.exists())
         self.assertEqual(mark.read_text(), "", "the marker holds no reply text")
 
+    def phone_turn(self, live=True):
+        t, sid = Path(self.env["TMPDIR"]), self.payload["session_id"]
+        (t / f"claude-voice.{sid}").touch()
+        (t / f"claude-talk.turn.{sid}").write_text("0")
+        if live:
+            (t / "claude-talk.live").touch()
+        return t, sid
+
+    def test_phone_turn_is_answered_on_the_phone_not_the_mac(self):
+        t, sid = self.phone_turn()
+        self.assertSilentExit0(self.run_hook(json.dumps(self.payload)))
+        self.assertTrue((t / f"claude-talk.reply.{sid}").read_text().startswith("It worked."))
+        self.assertFalse((t / f"claude-voice.spoke.{sid}").exists(), "nothing was spoken on the Mac")
+        self.assertFalse((t / f"claude-talk.turn.{sid}").exists(), "one reply per phone turn")
+        self.run_hook(json.dumps(self.payload))                       # the next turn was typed at the desk
+        self.assertTrue((t / f"claude-voice.spoke.{sid}").exists())
+
+    def test_phone_turn_with_the_page_gone_is_spoken_on_the_mac(self):
+        t, sid = self.phone_turn(live=False)
+        self.run_hook(json.dumps(self.payload))
+        self.assertFalse((t / f"claude-talk.reply.{sid}").exists())
+        self.assertTrue((t / f"claude-voice.spoke.{sid}").exists())
+
+    def test_phone_turn_gets_the_spoken_note(self):
+        self.phone_turn()
+        r = self.run_hook(json.dumps({**self.payload, "hook_event_name": "UserPromptSubmit"}))
+        self.assertIn("SPOKEN", r.stdout)
+
     def test_session_flag_speaks_only_that_session(self):
         (Path(self.env["TMPDIR"]) / f"claude-voice.{self.payload['session_id']}").touch()
         self.run_hook(json.dumps(self.payload))

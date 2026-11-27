@@ -6,6 +6,7 @@
 #          and a self-test. Safe to re-run: every step skips what is already right.
 # Usage:   cd ~/Projects/voiceLoop && ./install.sh            # install + test
 #          ./install.sh --check                                # test only, change nothing
+#            (it does open the mic for 2 s to measure the room; --no-measure skips that)
 #          (Without --check it runs `brew install` for missing tools without asking.)
 #          ./install.sh --no-kokoro                            # skip the 350 MB neural voice (use `say`)
 #          ./install.sh --quiet                                # no test sound
@@ -70,12 +71,12 @@ step "2. Scripts -> $HOOKS"
 SRC=$HERE/scripts; where="this repo"
 if [[ -n $DEV_SRC && -f "$DEV_SRC/voice-speak.py" ]]; then
   SRC=$DEV_SRC; where="the developer source"
-  for f in voice-speak.py voice-listen.py voice-kokoro.py; do   # the repo copy is what others install
+  for f in voice-speak.py voice-listen.py voice-kokoro.py voice-talk.py; do   # the repo copy is what others install
     cmp -s "$SRC/$f" "$HERE/scripts/$f" || fail "scripts/$f differs from $SRC: cp -p \"$SRC/$f\" scripts/ and commit"
   done
 fi
 do_ mkdir -p "$HOOKS" 2>/dev/null
-for f in voice-speak.py voice-listen.py voice-kokoro.py; do
+for f in voice-speak.py voice-listen.py voice-kokoro.py voice-talk.py; do
   if [[ -f "$SRC/$f" ]] && ! cmp -s "$SRC/$f" "$HOOKS/$f"; then
     if do_ cp -p "$SRC/$f" "$HOOKS/$f" && chmod +x "$HOOKS/$f"; then pass "$f (copied from $where)"
     elif [[ -e "$HOOKS/$f" ]]; then fail "$f differs from the copy in $where"
@@ -214,7 +215,7 @@ fi
 step "7. Self-test"
 tlog=$(mktemp -t voiceloop-tests)
 # Test the INSTALLED copies (proves what will actually run).
-if VOICE_SPEAK=$HOOKS/voice-speak.py VOICE_LISTEN=$HOOKS/voice-listen.py VOICE_KOKORO=$HOOKS/voice-kokoro.py \
+if VOICE_SPEAK=$HOOKS/voice-speak.py VOICE_LISTEN=$HOOKS/voice-listen.py VOICE_KOKORO=$HOOKS/voice-kokoro.py VOICE_TALK=$HOOKS/voice-talk.py \
    python3 -m unittest discover -s "$HERE/tests" >"$tlog" 2>&1; then
   pass "test suite: $(grep -Eo 'Ran [0-9]+ tests' "$tlog")"
 else fail "test suite failed:"; tail -15 "$tlog" | sed 's/^/        /'; fi

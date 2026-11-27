@@ -119,6 +119,13 @@ DEFAULTS = {
     "confirm_seconds": 8,        # how long a confirmation waits for "yes"
     "idle_minutes": 20,          # nothing sent for this long -> stop listening (mic off)
     "pane_check_seconds": 60,    # while idle, re-check that Claude still runs in the pane
+    "quiet_threshold": "",       # `voice quiet on`: the threshold for a soft voice
+                                 # ("" = 0.6 x threshold). Applies from the next recording.
+    # Spoken snippets: "snippet <name>" in a sentence becomes the stored text.
+    # {"standup": "Summarise what changed since yesterday, …"}; per project in voice.json too.
+    "snippets": {},
+    "log_hours": 24,             # what you say is logged in plain text: after this many hours
+                                 # the log is set aside, then deleted (kept 2 x at most). 0 = keep
 }
 # Whisper's classic inventions on silence/noise. Matched against the WHOLE
 # transcript only, so a real sentence containing these words still goes through.
@@ -178,6 +185,90 @@ def spoke_file(claude_sid: str = "") -> Path:
     return tmp_dir() / f"claude-voice.spoke.{claude_sid}" if claude_sid else LAST_SPOKEN()
 
 
+# --- the Talk page (voice-talk.py) as a second input ---------------------------------
+TALK_LIVE = lambda: tmp_dir() / "claude-talk.live"   # noqa: E731  touched by voice-talk.py while a page streams
+
+
+def phone_live(max_age: float = 3.0) -> bool:
+    """True while a Talk page is streaming audio. Then the phone IS the microphone and the
+    desk mic rests: with both open, one sentence arrived twice (a headset reaches the next
+    room). The marker ages out by itself, so a crashed server can't mute the desk."""
+    try:
+        return time.time() - TALK_LIVE().stat().st_mtime < max_age
+    except OSError:
+        return False
+
+
+def once_file(claude_sid: str) -> Path:
+    """Written by `listen once` while it waits: tells voice-talk.py an app session is listening."""
+    return tmp_dir() / f"claude-listen.once.{claude_sid}"
+
+
+def inbox_file(claude_sid: str) -> Path:
+    return tmp_dir() / f"claude-talk.inbox.{claude_sid}"
+
+
+def turn_file(claude_sid: str) -> Path:
+    """Written by voice-talk.py when it delivers: "this turn came from the phone". The Stop
+    hook (voice-speak.py) then answers into reply_file() instead of speaking on the Mac."""
+    return tmp_dir() / f"claude-talk.turn.{claude_sid}"
+
+
+def reply_file(claude_sid: str) -> Path:
+    return tmp_dir() / f"claude-talk.reply.{claude_sid}"
+
+
+def put_inbox(claude_sid: str, result: dict) -> None:
+    """voice-talk.py hands an utterance to the session's waiting `listen once`. Written
+    whole, then renamed, so the reader never sees half a file."""
+    tmp = inbox_file(claude_sid).with_suffix(f".{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(result))
+    os.replace(tmp, inbox_file(claude_sid))
+
+
+def take_inbox(claude_sid: str):
+    """One waiting phone utterance as a `listen once` result, or None. Read-and-delete.
+    The Talk server already ran it through clean() and the Gate; defang() again anyway,
+    because this text becomes a message to Claude."""
+    f = inbox_file(claude_sid)
+    try:
+        raw = f.read_text()
+        f.unlink()
+        d = json.loads(raw)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(d, dict) or d.get("status") not in ("heard", "command"):
+        return None
+    heard = defang(re.sub(r"[\x00-\x1f\x7f]", " ", str(d.get("heard") or "")))[:4000].strip()
+    if not heard:
+        return None
+    out = {"status": d["status"], "heard": heard, "via": "phone"}
+    if d["status"] == "command":
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,60}", str(d.get("command") or "")):
+            return None
+        out["command"] = d["command"]
+    return out
+
+
+def waiting_sessions() -> list:
+    """App sessions with a `listen once` running right now, newest first:
+    [{"claude_session", "cwd", "wake", "ts"}]. Markers of dead processes are removed."""
+    out = []
+    for f in tmp_dir().glob("claude-listen.once.*"):
+        try:
+            d = json.loads(f.read_text())
+            os.kill(int(d["pid"]), 0)
+        except (OSError, ValueError, KeyError, TypeError):
+            try:
+                f.unlink()
+            except OSError:
+                pass
+            continue
+        out.append({"claude_session": f.name.split(".once.", 1)[1], "cwd": str(d.get("cwd") or ""),
+                    "wake": bool(d.get("wake")), "ts": float(d.get("ts") or 0)})
+    return sorted(out, key=lambda w: -w["ts"])
+
+
 def load_config() -> dict:
     cfg = dict(DEFAULTS)
     try:
@@ -191,9 +282,41 @@ def load_config() -> dict:
     return cfg
 
 
+def rotate_log(hours: float, now: float = 0.0) -> None:
+    """The log holds what you said, in plain text. Once the file is older than `hours` it
+    becomes claude-listen.log.old (replacing the previous one), and a .old that was last
+    written more than `hours` ago is deleted: text is kept for 2 x hours at most. The newest
+    lines stay readable for troubleshooting meanwhile. 0 (or less) = keep everything."""
+    if hours <= 0:
+        return
+    now, path = now or time.time(), LOG()
+    old = path.with_name(path.name + ".old")
+    try:
+        if now - old.stat().st_mtime > hours * 3600:
+            old.unlink()
+    except OSError:
+        pass
+    try:
+        st = path.stat()
+        if now - getattr(st, "st_birthtime", st.st_ctime) > hours * 3600:
+            os.replace(path, old)
+    except OSError:
+        pass
+
+
+_LOG_CHECKED = 0.0
+
+
 def log(msg: str) -> None:
+    global _LOG_CHECKED
     line = f"{time.strftime('%H:%M:%S')} {msg}"
     print(line, file=sys.stderr, flush=True)   # stderr: stdout is --once's JSON result
+    if time.time() - _LOG_CHECKED > 3600:      # at start, then hourly: cheap, and never per line
+        _LOG_CHECKED = time.time()
+        try:
+            rotate_log(float(load_config().get("log_hours") or 0))
+        except (TypeError, ValueError):
+            pass
     try:
         with LOG().open("a") as f:
             f.write(line + "\n")
@@ -211,9 +334,35 @@ def _rms(frame: bytes) -> float:
     return math.sqrt(sum(x * x for x in a) / len(a)) / 32768 if a else 0.0
 
 
-def _threshold(cfg: dict) -> float:
-    t = str(cfg["threshold"]).strip()
+QUIET = lambda: voice_dir() / "quiet"   # noqa: E731  flag file: `voice quiet on` / `off`
+QUIET_FACTOR = 0.6   # quiet threshold when none is set. suggest_threshold() leaves the normal
+                     # one at >= 2.5 x the room's median noise, so 0.6 x is still above the room.
+
+
+def _level(t) -> float:
+    t = str(t).strip()
     return float(t[:-1]) / 100 if t.endswith("%") else float(t)
+
+
+def quiet_on() -> bool:
+    try:
+        return QUIET().exists()
+    except OSError:
+        return False
+
+
+def _threshold(cfg: dict) -> float:
+    """The loudness that counts as sound. With `voice quiet on` (a soft voice, e.g. while
+    someone sleeps) the lower quiet threshold applies. capture() asks on every recording,
+    so the switch works on a running listener."""
+    base = _level(cfg["threshold"])
+    if quiet_on():
+        try:
+            q = str(cfg.get("quiet_threshold") or "").strip()
+            return _level(q) if q else base * QUIET_FACTOR
+        except ValueError:
+            return base * QUIET_FACTOR
+    return base
 
 
 def suggest_threshold(levels: list) -> dict:
@@ -245,6 +394,35 @@ def device_missing(device: str, status: str, returncode) -> bool:
     """True when a chosen mic couldn't be opened (unplugged, renamed): sox exited by itself
     with an error before any sound. Our own terminate() gives -15, a normal end 0."""
     return bool(device) and status == "fail" and returncode not in (0, None, -15)
+
+
+MIC_WARN_EVERY = 600   # seconds between spoken "your mic isn't connected" notices
+
+
+def should_warn(last: float, now: float, every: float = MIC_WARN_EVERY) -> bool:
+    return now - last >= every
+
+
+def warn_missing_mic(device: str) -> None:
+    """Say ONCE in a while that the chosen mic is gone. The fallback mic still uses the
+    chosen mic's threshold, which may not fit it (a noisier mic can record until
+    max_seconds), so the user should know rather than wonder. The marker file keeps app
+    mode (a new process per utterance) from repeating it every time."""
+    marker = tmp_dir() / "claude-listen.micwarn"
+    try:
+        last = marker.stat().st_mtime
+    except OSError:
+        last = 0.0
+    if not should_warn(last, time.time()):
+        return
+    try:
+        marker.touch()
+    except OSError:
+        pass
+    try:
+        say_local(f"Your microphone {device} isn't connected, so I'm using the default one.")
+    except Exception:
+        pass   # a notice must never break listening
 
 
 def measure_room(secs: float = 2.0, device: str = "") -> dict:
@@ -304,15 +482,16 @@ def write_wav(path: str, pcm: bytes) -> None:
         w.writeframes(pcm)
 
 
-def record(cfg: dict, wav: str, deadline: float = 0.0) -> str:
+def record(cfg: dict, wav: str, deadline: float = 0.0, also=lambda: False) -> str:
     """Mic -> capture() -> wav. Returns "ok", "fail", or "spoke": TTS started while
     the mic was open (e.g. the reply to something typed), so the recording is
-    discarded. Otherwise we'd transcribe Samantha and send her words back to Claude."""
+    discarded. Otherwise we'd transcribe Samantha and send her words back to Claude.
+    `also`: one more reason to drop the recording (the Talk page took over as the mic)."""
     device = str(cfg.get("device") or "")
     p = subprocess.Popen(rec_cmd(device), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                          stderr=subprocess.DEVNULL)
     try:
-        status, pcm = capture(p.stdout, cfg, interrupted=lambda: speaking() or CONTROL().exists(),
+        status, pcm = capture(p.stdout, cfg, interrupted=lambda: speaking() or CONTROL().exists() or also(),
                               deadline=deadline)
     finally:
         if p.poll() is None:
@@ -322,7 +501,8 @@ def record(cfg: dict, wav: str, deadline: float = 0.0) -> str:
         # The chosen mic is gone (unplugged): keep listening on the default input rather
         # than stop. Retried every utterance, so plugging it back in switches back.
         log(f"mic {device!r} not available; using the default input")
-        return record({**cfg, "device": ""}, wav, deadline)
+        warn_missing_mic(device)
+        return record({**cfg, "device": ""}, wav, deadline, also)
     if status == "ok":
         write_wav(wav, pcm)
     return status
@@ -348,9 +528,11 @@ PROMPT_MAX = 600   # chars; whisper's prompt is capped at ~224 tokens, keep well
 
 
 def project_vocab(cwd: str) -> dict:
-    """<project>/.claude/voice.json: {"vocabulary": [...], "replacements": {...}}.
-    Read fresh on every utterance, so edits apply to the next sentence."""
-    out = {"vocabulary": [], "replacements": {}}
+    """<project>/.claude/voice.json: {"vocabulary": [...], "replacements": {...},
+    "snippets": {...}, "scanned": [...]}. "scanned" is what `voice words scan` found in
+    the project; it comes after your own "vocabulary". Read fresh on every utterance, so
+    edits apply to the next sentence."""
+    out = {"vocabulary": [], "replacements": {}, "snippets": {}}
     if not cwd:
         return out
     try:
@@ -358,12 +540,14 @@ def project_vocab(cwd: str) -> dict:
     except (OSError, ValueError):
         return out
     if isinstance(d, dict):
-        v = d.get("vocabulary")
-        if isinstance(v, list):
-            out["vocabulary"] = [t.strip()[:60] for t in v if isinstance(t, str) and t.strip()]
-        r = d.get("replacements")
-        if isinstance(r, dict):
-            out["replacements"] = {k: v for k, v in r.items() if isinstance(k, str) and isinstance(v, str)}
+        for key in ("vocabulary", "scanned"):
+            v = d.get(key)
+            if isinstance(v, list):
+                out["vocabulary"] += [t.strip()[:60] for t in v if isinstance(t, str) and t.strip()]
+        for key in ("replacements", "snippets"):
+            r = d.get(key)
+            if isinstance(r, dict):
+                out[key] = {k: v for k, v in r.items() if isinstance(k, str) and isinstance(v, str)}
     return out
 
 
@@ -408,7 +592,31 @@ def effective(cfg: dict, cwd: str) -> dict:
             seen.add(t.lower())
     e["prompt"] = ", ".join(terms)
     e["replacements"] = {**(cfg.get("replacements") or {}), **wl["replacements"], **pv["replacements"]}
+    own = cfg.get("snippets")
+    e["snippets"] = {**(own if isinstance(own, dict) else {}), **pv["snippets"]}
     return e
+
+
+SNIPPET_MAX = 2000   # chars of one snippet's text
+
+
+def expand_snippets(text: str, snippets) -> str:
+    """"snippet <name>" anywhere in a sentence becomes the stored text. The word "snippet"
+    is required, so a name that is an ordinary word can't fire by accident. Whisper's
+    comma or colon after "snippet" and a hyphen inside the name are accepted; longer names
+    are tried first ("standup long" before "standup"). The text is flattened to one line:
+    a newline typed into the pane would send the message early."""
+    if not isinstance(snippets, dict):
+        return text
+    for name in sorted((n for n in snippets if isinstance(n, str)), key=len, reverse=True):
+        words, body = re.findall(r"[A-Za-z0-9]+", name), snippets[name]
+        if not words or not isinstance(body, str):
+            continue
+        flat = re.sub(r"\s+", " ", re.sub(r"[\x00-\x1f\x7f]", " ", body)).strip()[:SNIPPET_MAX]
+        if flat:
+            pat = r"\bsnippet[\s,:-]+" + r"[\s-]+".join(re.escape(w) for w in words) + r"\b"
+            text = re.sub(pat, lambda m: flat, text, flags=re.I)
+    return text
 
 
 def defang(text: str) -> str:
@@ -424,6 +632,7 @@ def clean(text: str, cfg: dict) -> str:
     text = re.sub(r"\s+", " ", text).strip()
     for wrong, right in (cfg.get("replacements") or {}).items():
         text = re.sub(rf"\b{re.escape(wrong)}\b", right, text, flags=re.I)
+    text = expand_snippets(text, cfg.get("snippets"))            # BEFORE defang: a snippet can't start a command either
     text = defang(text).strip()                                  # never a shell / slash command
     if text.lower().strip(" .!?,") in HALLUCINATIONS or not re.search(r"[A-Za-z0-9]", text):
         return ""
@@ -752,11 +961,26 @@ def listen_once(cfg: dict, timeout: float, wake: bool = False, cwd: str = "",
     behave identically. rec/stt are injectable for tests.
     Returns {"status": "heard"|"stop"|"timeout"|"busy"|"fail", "heard": text}.
     (First prototyped as a shell wrapper around an older --once; folded in here so the
-    timeout ends cleanly and the log stays in $TMPDIR.)"""
-    rec = rec or record
-    stt = stt or (lambda c, w: clean(transcribe(c, w), c))
+    timeout ends cleanly and the log stays in $TMPDIR.)
+    The Talk page (voice-talk.py) is a second source: while this waits, a marker file says
+    so; an utterance from the phone arrives in the session's inbox and is returned like a
+    heard one (plus "via": "phone"). While a page is streaming, the mic here stays closed."""
     if listener_running():
         return {"status": "busy", "heard": ""}
+    if not claude_sid:
+        return _listen_once(cfg, timeout, wake, cwd, rec, stt, claude_sid)
+    once_file(claude_sid).write_text(json.dumps(
+        {"pid": os.getpid(), "cwd": cwd, "wake": bool(wake), "ts": time.time()}))
+    try:
+        return _listen_once(cfg, timeout, wake, cwd, rec, stt, claude_sid)
+    finally:
+        once_file(claude_sid).unlink(missing_ok=True)
+
+
+def _listen_once(cfg: dict, timeout: float, wake: bool, cwd: str, rec, stt, claude_sid: str) -> dict:
+    from_phone = lambda: bool(claude_sid) and inbox_file(claude_sid).exists()   # noqa: E731
+    rec = rec or (lambda c, w, deadline=0.0: record(c, w, deadline, also=lambda: phone_live() or from_phone()))
+    stt = stt or (lambda c, w: clean(transcribe(c, w), c))
     end = time.time() + timeout
     ecfg = effective(cfg, cwd)
     gate = Gate(wake, float(cfg["follow_up_seconds"]), stop=lambda t: is_stop(t, cfg),
@@ -772,6 +996,13 @@ def listen_once(cfg: dict, timeout: float, wake: bool = False, cwd: str = "",
     with tempfile.TemporaryDirectory(prefix="voiceloop-once-") as td:
         wav = os.path.join(td, "utt.wav")
         while time.time() < end:
+            got = take_inbox(claude_sid) if claude_sid else None
+            if got:
+                log(f"app mode: from the phone: {got['heard']}")
+                return got
+            if phone_live():       # a Talk page is the microphone now: wait for its inbox only
+                time.sleep(0.25)
+                continue
             wait_quiet(cfg)
             r = rec(cfg, wav, deadline=end)
             if r == "timeout":
@@ -779,6 +1010,8 @@ def listen_once(cfg: dict, timeout: float, wake: bool = False, cwd: str = "",
             if r == "fail":
                 log("app mode: recording failed (does this app have Microphone permission?)")
                 return {"status": "fail", "heard": ""}
+            if r == "spoke" and (phone_live() or from_phone()):
+                continue           # not our reply: the phone took over; handled at the loop top
             if r == "spoke":
                 log("app mode: our own reply started; recording discarded")
                 wait_quiet(cfg)
@@ -1119,10 +1352,15 @@ def loop(iterm_sid: str, claude_sid: str, cfg: dict, wake: bool = False) -> None
                 else:
                     log(f"asked to switch to unknown project {ctl[1]!r}")
                 continue
+            if phone_live():       # a Talk page is the microphone now (one input at a time)
+                last_active = time.time()   # talking on the phone is not "idle"
+                time.sleep(0.5)
+                continue
             wait_quiet(cfg)
             log("listening…")
             r = record(cfg, wav, deadline=min(last_active + idle_s,
-                                              time.time() + float(cfg["pane_check_seconds"])))
+                                              time.time() + float(cfg["pane_check_seconds"])),
+                       also=phone_live)
             if r == "timeout":
                 if time.time() >= last_active + idle_s:
                     log("idle timeout; conversation mode OFF")
@@ -1136,8 +1374,8 @@ def loop(iterm_sid: str, claude_sid: str, cfg: dict, wake: bool = False) -> None
                     return
                 continue
             if r == "spoke":
-                if CONTROL().exists():
-                    continue          # a control request interrupted listening; handled at the loop top
+                if CONTROL().exists() or phone_live():
+                    continue          # a control request or the Talk page interrupted; handled at the loop top
                 log("(Claude started speaking; recording discarded)")
                 wait_quiet(cfg)
                 gate.replied(time.time())   # ANY spoken reply opens the window
@@ -1589,8 +1827,218 @@ def bench_cli(argv: list) -> int:
     return 0
 
 
+# --- project scan: a vocabulary from the project's own names --------------------------
+SCAN_SKIP = {"node_modules", "venv", "dist", "build", "vendor", "target", "__pycache__", "site-packages",
+             "tests", "test", "__tests__", "fixtures"}   # test names are written, not spoken
+SCAN_CODE = {".py", ".js", ".jsx", ".ts", ".tsx", ".sh", ".go", ".rs", ".swift", ".rb", ".php",
+             ".java", ".kt", ".c", ".h", ".cpp", ".cs", ".sql"}
+SCAN_DOCS = {".md", ".txt"}
+SCAN_CHARS, SCAN_TERMS = 300, 40      # half of PROMPT_MAX: your own words must still fit
+SCAN_FILES, SCAN_BYTES = 3000, 400_000
+DEFINED = re.compile(r"\b(?:def|class|function|const|let|var|func|fn|struct|interface|type|enum)"
+                     r"\s+([A-Za-z_][A-Za-z0-9_]*)")
+# Not in a dictionary, but Whisper spells them without help (or nobody says them aloud).
+SCAN_STOP = set("""args argv kwargs async await bool cfg config configs const ctx dict enum env
+    func html http https init json kwarg lib localhost metadata noqa param params plugin plugins
+    readme repo repos src stderr stdin stdout str struct sudo tmp todo url urls utf util utils
+    api apis app apps css dev docs git sql yaml yml toml txt cli gui ok okay etc eg ie
+    macos github homebrew python javascript typescript inbox downloads diff iphone ipad attr
+    attrs mtime stdlib setup teardown jsonl beep cookie cookies inline gotcha gotchas lang
+    vocab symlink symlinks unsubscribe""".split())
+DICT = Path("/usr/share/dict/words")
+
+
+def load_dictionary(path=None) -> set:
+    try:
+        return {w.strip().lower() for w in Path(path or DICT).read_text(errors="ignore").split()}
+    except OSError:
+        return set()
+
+
+def _known(word: str, words: set) -> bool:
+    """In the dictionary, as itself, as a plain inflection (the macOS list has few plurals
+    or -ed/-ing forms), or as two dictionary words joined ("timeout", "filename")."""
+    w = word.lower()
+    stems = [w]
+    for suffix in ("s", "es", "ed", "d", "ing", "ly", "er", "ers", "able", "est", "en"):
+        if w.endswith(suffix):
+            base = w[: -len(suffix)]
+            stems += [base, base + "e"] + ([base[:-1]] if base[-2:-1] == base[-1:] else [])   # stopped -> stop
+    if w.endswith(("ies", "ied")):
+        stems.append(w[:-3] + "y")
+    if any(len(s) >= 3 and s in words for s in stems):
+        return True
+    return any(w[:i] in words and w[i:] in words for i in range(3, len(w) - 2))
+
+
+def scan_worthy(token: str, words: set) -> bool:
+    """A name Whisper is likely to spell wrong: mixed case inside (useEffect, voiceLoop),
+    or a word no dictionary knows (Kokoro). Never numbers, ALL CAPS, or very short."""
+    if not 3 <= len(token) <= 30 or not token.isalpha() or token.isupper():
+        return False
+    low = token.lower()
+    if low in SCAN_STOP or re.fullmatch(r"x?[a-f]+", low) or low == Path.home().name.lower():
+        return False                       # noise words, hex strings (ffe0, xffffb), your login name
+    if re.search(r"[a-z][A-Z]", token):
+        return True
+    return bool(words) and len(token) >= 4 and not _known(token, words)
+
+
+def scan_terms(root, words=None, have=(), max_chars: int = SCAN_CHARS, max_terms: int = SCAN_TERMS) -> list:
+    """Names from a project that are worth a place in Whisper's vocabulary hint, best first.
+    Sources and weight: the folder name (5), file names (3), names DEFINED in code (2 each:
+    def / class / function / const …), unknown words in the docs (1 each; twice at least).
+    Ordered by weight, cut to `max_chars`. `have` = words already listed elsewhere."""
+    root = Path(root)
+    words = load_dictionary() if words is None else words
+    score, spelled, doc_only = collections.Counter(), {}, collections.Counter()
+
+    def add(token: str, weight: int, doc: bool = False) -> None:
+        for part in ([token] if re.search(r"[a-z][A-Z]", token) else re.split(r"[_\W]+", token)):
+            if scan_worthy(part, words):
+                key = part.lower()
+                score[key] += weight
+                spelled.setdefault(key, collections.Counter())[part] += 1
+                if doc:
+                    doc_only[key] += 1
+                else:
+                    doc_only[key] += 2      # a name in code or a file name counts at once
+
+    add(root.resolve().name, 5)
+    seen = 0
+    for folder, dirs, files in os.walk(root):
+        dirs[:] = sorted(d for d in dirs if d not in SCAN_SKIP and not d.startswith("."))
+        for name in sorted(files):
+            p = Path(folder) / name
+            ext = p.suffix.lower()
+            if name.startswith(".") or ext not in SCAN_CODE | SCAN_DOCS:
+                continue
+            seen += 1
+            if seen > SCAN_FILES:
+                break
+            add(p.stem, 3)
+            try:
+                if p.stat().st_size > SCAN_BYTES:
+                    continue
+                text = p.read_text(errors="ignore")
+            except OSError:
+                continue
+            if ext in SCAN_CODE:
+                for m in DEFINED.finditer(text):
+                    add(m.group(1), 2)
+            else:
+                for m in re.finditer(r"[A-Za-z]+(?:'[A-Za-z]+)?", text):
+                    if "'" not in m.group(0):          # "doesn't" must not become "doesn"
+                        add(m.group(0), 1, doc=True)
+    skip = {h.lower() for h in have}
+    out = []
+    for key, _ in sorted(score.items(), key=lambda kv: (-kv[1], kv[0])):
+        term = spelled[key].most_common(1)[0][0]
+        if key in skip or doc_only[key] < 2:
+            continue
+        if len(out) >= max_terms or len(", ".join(out + [term])) > max_chars:
+            break
+        out.append(term)
+    return out
+
+
+def scan_cli(args: list) -> int:
+    """voice words scan [folder] [--dry]: write what scan_terms() finds to
+    <folder>/.claude/voice.json as "scanned". Your own "vocabulary" there is never touched."""
+    dry = "--dry" in args
+    rest = [a for a in args if a != "--dry"]
+    root = Path(rest[0]).expanduser() if rest else Path.cwd()
+    if not root.is_dir():
+        print(f"scan: not a folder: {root}", file=sys.stderr)
+        return 2
+    path = root / ".claude" / "voice.json"
+    data = {}
+    if path.exists():
+        try:
+            data = json.loads(path.read_text())
+        except (OSError, ValueError):
+            data = None
+        if not isinstance(data, dict):
+            print(f"scan: {path} is not valid JSON; fix or remove it first", file=sys.stderr)
+            return 1
+    own = [t for t in data.get("vocabulary") or [] if isinstance(t, str)]
+    words = load_dictionary()
+    terms = scan_terms(root, words, have=own + load_words()["vocabulary"])
+    if not words:
+        print("scan: no system dictionary found; only mixedCase names are picked")
+    print(f"{root.name}: {len(terms)} name(s) for Whisper" + (":" if terms else ""))
+    for t in terms:
+        print(f"  {t}")
+    if dry:
+        print("(--dry: nothing written)")
+        return 0
+    if terms or "scanned" in data:
+        data["scanned"] = terms
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data, indent=2) + "\n")
+        print(f"written to {path} (\"scanned\"). Remove names you don't say; scan again after big changes.")
+    used = len(effective(load_config(), str(root))["prompt"])
+    print(f"vocabulary hint for this project: {used} of {PROMPT_MAX} characters")
+    return 0
+
+
+def snippets_cli(args: list) -> int:
+    """voice snippets [list] | add <name> = <text> | remove <name>   (config.json, "listen")"""
+    sub, rest = (args[0] if args else "list"), " ".join(args[1:]).strip()
+    have = load_config().get("snippets")
+    have = dict(have) if isinstance(have, dict) else {}
+    if sub == "add" and "=" in rest:
+        name, body = (x.strip() for x in rest.split("=", 1))
+        if not re.search(r"[A-Za-z0-9]", name) or not body:
+            print("snippets: need a name and a text: voice snippets add <name> = <text>", file=sys.stderr)
+            return 2
+        have[name.lower()] = body[:SNIPPET_MAX]
+        save_listen({"snippets": have})
+        print(f"snippet {name.lower()!r} saved. Say: snippet {name.lower()}")
+    elif sub == "remove" and rest:
+        if have.pop(rest.lower(), None) is None:
+            print(f"snippets: no snippet named {rest!r}", file=sys.stderr)
+            return 1
+        save_listen({"snippets": have})
+        print(f"snippet {rest.lower()!r} removed")
+    elif sub != "list":
+        print("usage: voice snippets [list] | add <name> = <text> | remove <name>", file=sys.stderr)
+        return 2
+    print(f"{len(have)} snippet(s)" + (" (say \"snippet\" and the name):" if have else
+                                        ". Add one: voice snippets add <name> = <text>"))
+    for name, body in have.items():
+        print(f"  {name}: {body[:70]}{'…' if len(body) > 70 else ''}")
+    return 0
+
+
+def quiet_cli(args: list) -> int:
+    """voice quiet [on | off | status]: the lower threshold for a soft voice."""
+    sub = args[0] if args else "status"
+    if sub == "on":
+        QUIET().parent.mkdir(parents=True, exist_ok=True)
+        QUIET().write_text("")
+    elif sub == "off":
+        try:
+            QUIET().unlink()
+        except OSError:
+            pass
+    elif sub != "status":
+        print("usage: voice quiet [on | off | status]", file=sys.stderr)
+        return 2
+    cfg = load_config()
+    print(f"quiet: {'ON' if quiet_on() else 'off'}  (threshold now {_threshold(cfg) * 100:.2f}%, "
+          f"normal {_level(cfg['threshold']) * 100:.2f}%)")
+    if sub == "on":
+        print("Applies from the next recording. If a recording never ends (the room is louder\n"
+              "than the quiet threshold), set \"quiet_threshold\" in config.json a little higher.")
+    return 0
+
+
 def words_cli(args: list) -> int:
-    """voice words [list] | add <word or phrase> | fix <heard> = <Right> | remove <word>"""
+    """voice words [list] | add <word or phrase> | fix <heard> = <Right> | remove <word>
+    | scan [folder] [--dry]"""
+    if args[:1] == ["scan"]:
+        return scan_cli(args[1:])
     path, sub = WORDS(), (args[0] if args else "list")
     rest = " ".join(args[1:]).strip()
     lines = path.read_text().splitlines() if path.exists() else [
@@ -1613,8 +2061,8 @@ def words_cli(args: list) -> int:
                  or l.lstrip().startswith("#")]
         print(f"removed {before - len(lines)} line(s)")
     elif sub != "list":
-        print("usage: voice words [list] | add <word>[, <word>…] | fix <heard> = <Right> | remove <word>",
-              file=sys.stderr)
+        print("usage: voice words [list] | add <word>[, <word>…] | fix <heard> = <Right> | remove <word>"
+              " | scan [folder] [--dry]", file=sys.stderr)
         return 2
     if sub != "list":
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -1636,6 +2084,10 @@ def main() -> int:
         return words_cli(sys.argv[2:])
     if sys.argv[1:2] == ["--benchmark"]:
         return bench_cli(sys.argv[2:])
+    if sys.argv[1:2] == ["--snippets"]:
+        return snippets_cli(sys.argv[2:])
+    if sys.argv[1:2] == ["--quiet"]:
+        return quiet_cli(sys.argv[2:])
     ap = argparse.ArgumentParser(description="voiceLoop conversation mode")
     ap.add_argument("--iterm-session", default=os.environ.get("ITERM_SESSION_ID", ""))
     ap.add_argument("--claude-session", default=os.environ.get("CLAUDE_CODE_SESSION_ID", ""))

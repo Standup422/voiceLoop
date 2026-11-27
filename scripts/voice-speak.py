@@ -329,6 +329,40 @@ def speak(text: str, cfg: dict, sid: str = "") -> None:
     pid_file().write_text(str(p.pid))
 
 
+# --- the Talk page (voice-talk.py): a turn that came from the phone is answered there ----
+PHONE_TURN_MAX = 900     # seconds: an older marker is a turn that never got its reply
+
+
+def _age(path: Path) -> float:
+    try:
+        return time.time() - path.stat().st_mtime
+    except OSError:
+        return float("inf")
+
+
+def phone_turn(sid: str, max_age: float = PHONE_TURN_MAX) -> bool:
+    """True if this session's current turn was spoken into a Talk page that is still
+    streaming. voice-talk.py writes claude-talk.turn.<session> when it delivers, and
+    touches claude-talk.live about once a second while a page is connected."""
+    return bool(sid) and _age(tmp_dir() / f"claude-talk.turn.{sid}") < max_age \
+        and _age(tmp_dir() / "claude-talk.live") < 3.0
+
+
+def to_phone(text: str, sid: str) -> None:
+    """Hand the reply text to voice-talk.py (it makes the audio and the page plays it).
+    The Mac stays quiet for this turn. Written whole, then renamed. An empty reply is
+    written too, so the page stops waiting."""
+    stop_speech()
+    try:
+        last_file().write_text(text)
+        tmp = tmp_dir() / f"claude-talk.reply.{sid}.{os.getpid()}.tmp"
+        tmp.write_text(text)
+        os.replace(tmp, tmp_dir() / f"claude-talk.reply.{sid}")
+        (tmp_dir() / f"claude-talk.turn.{sid}").unlink()
+    except OSError:
+        pass
+
+
 # --- pane registry (for "switch to <project>" in voice-listen.py) ---------------
 def panes_dir() -> Path:
     return tmp_dir() / "claude-voice-panes"
@@ -371,7 +405,8 @@ def prompt_submit(payload: dict) -> None:
     """UserPromptSubmit: a new message ends any speech still playing (typing over
     Samantha shuts her up), and in conversation mode it gets the short-answer note."""
     stop_speech()
-    if listening_to(safe_sid(payload.get("session_id"))):
+    sid = safe_sid(payload.get("session_id"))
+    if listening_to(sid) or phone_turn(sid, max_age=15):   # typed in by the listener, or by the Talk page just now
         print(json.dumps({"hookSpecificOutput": {
             "hookEventName": "UserPromptSubmit", "additionalContext": SPOKEN_CONTEXT}}))
 
@@ -398,6 +433,8 @@ def hook_main(dry_run: bool = False) -> None:
     text = clean_for_speech(get_text(payload), str(cfg["mode"]), cfg["max_chars"])
     if dry_run:
         print(text)
+    elif phone_turn(sid):
+        to_phone(text, sid)
     elif text:
         speak(text, cfg, sid)
 
@@ -417,6 +454,11 @@ USAGE = """usage: voice on | off | session [on|off] | stop | status | test [text
   listen switch <project>   retarget the running listener
   status --json machine-readable state for dashboards (no transcript text)
   words [add X | fix heard = Right | remove X]   the word list Whisper should spell right
+  words scan [folder] [--dry]   collect a project's own names into its .claude/voice.json
+  snippets [add <name> = <text> | remove <name>]   say "snippet <name>" to send the text
+  quiet [on|off]   a lower mic threshold for a soft voice (from the next recording)
+  talk          Talk page: a browser or a paired phone as mic + speaker (voice-talk.py)
+                talk setup | talk ca | talk pair [--open] | talk phones | talk unpair <name>|all
   setup         interactive first-run wizard (run it in a terminal window)
   benchmark     score the Whisper models on computer-spoken sentences, no mic needed
                 [--models base,small] [--noise] [--quick] [--show] [--json]
@@ -619,6 +661,12 @@ def cli(args: list) -> int:
     elif cmd == "words":   # word list for Whisper; lives in voice-listen.py (it reads it)
         script = Path(__file__).resolve().parent / "voice-listen.py"
         os.execv(str(script), [str(script), "--words", *args[1:]])
+    elif cmd in ("snippets", "snippet", "quiet"):   # also voice-listen.py's (it owns clean() and the threshold)
+        script = Path(__file__).resolve().parent / "voice-listen.py"
+        os.execv(str(script), [str(script), "--quiet" if cmd == "quiet" else "--snippets", *args[1:]])
+    elif cmd == "talk":   # the Talk page: a browser or paired phone as mic + speaker (voice-talk.py)
+        script = Path(__file__).resolve().parent / "voice-talk.py"
+        os.execv(str(script), [str(script), *args[1:]])
     elif cmd == "benchmark":   # Whisper scoring; lives in voice-listen.py (it owns transcribe)
         script = Path(__file__).resolve().parent / "voice-listen.py"
         os.execv(str(script), [str(script), "--benchmark", *args[1:]])
