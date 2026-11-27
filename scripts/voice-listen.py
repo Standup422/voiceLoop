@@ -661,6 +661,16 @@ def is_incomplete(text: str) -> bool:
 ENDS_OK = {"that", "which", "too", "also", "then", "like"}   # real sentence ends
 
 
+HOLD_ON = re.compile(r"[\s,.;:!-]*\b(?:hang on|hold on|one moment|one second|give me a second|let me think)[\s.!,]*$", re.I)
+
+
+def held_back(text: str):
+    """"…, hang on." = I'm not done, keep listening. Returns the sentence so far without
+    that phrase (may be ""), or None when the utterance doesn't end with one."""
+    m = HOLD_ON.search(text)
+    return text[:m.start()].rstrip(" .,") if m else None
+
+
 def is_stop(text: str, cfg: dict) -> bool:
     t = re.sub(r"[^a-z ]", "", text.lower()).strip()
     return any(t == p or t.endswith(" " + p) for p in cfg["stop_phrases"])
@@ -921,6 +931,8 @@ def say_local(text: str) -> None:
 class Gate:
     """Pure decision logic, testable without a mic. feed() one cleaned utterance;
     it returns ("send", text) | ("hold", text) | ("ignore", text) | ("yes", "").
+    "hold" = the sentence isn't finished (it ends on "and…", or with "hang on"): it is
+    kept and the next utterance is joined to it.
     Rules: in wake mode an utterance must start with the wake word, unless we're in
     the follow-up window or continuing held text; the wake check runs on each
     utterance BEFORE joining held text; only accepted speech is ever held; held text
@@ -947,6 +959,11 @@ class Gate:
             elif not self.pending and now > self.awake_until and not self.stop(text):
                 return "ignore", text
         text = defang(f"{self.pending} {text}".strip())   # the wake word may have hidden a "/"
+        kept = held_back(text)
+        if kept is not None and not self.stop(text):
+            self.pending, self.pending_at = kept, now
+            self.awake_until = max(self.awake_until, now + self.follow)   # the rest needs no wake word
+            return "hold", kept
         if is_incomplete(text):
             self.pending, self.pending_at = text.rstrip(" .,"), now
             return "hold", self.pending

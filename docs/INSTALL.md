@@ -122,6 +122,11 @@ In a Claude Code session:
 - "**command** *name*" runs an allowed slash command: "command compact", or "command clear",
   which asks you to say yes first. Add your own skills to `"commands"` in the config.
 - "**stop listening**" turns the mic off.
+- Need a moment in the middle of a sentence? End with "**hang on**" (or "hold on", "one moment",
+  "let me think"). What you said so far is kept, and the rest is joined to it; the phrase itself
+  is never sent.
+- With several sessions speaking, a reply starts with "From *project*:" when a different session
+  spoke last, so you know who is talking.
 - Names it keeps getting wrong? `voice words add Zephyrine`, or `voice words fix cube control = kubectl`.
   Then `voice benchmark` (no mic needed) shows which words Whisper still misses.
 
@@ -180,6 +185,9 @@ How it behaves:
   "**say that again**" or tap the button to hear it once more; that doesn't start a new turn.
 - **Permission prompts appear on the Mac,** not on the phone. The phone tells you: "Claude is
   asking for permission in <project>." Answer at the desk, or say "stop" to decline and interrupt.
+- **Mic mode:** a small link at the bottom of the page switches between "processed by the
+  phone" (the browser's noise suppression and automatic gain) and "raw". If the first word of
+  your sentences keeps getting misheard, try raw. The page remembers the choice on that phone.
 - Say "stop listening" to end it.
 
 > **Keep the certificate authority to yourself.** `mkcert -CAROOT` shows a folder with a

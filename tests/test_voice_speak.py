@@ -197,6 +197,22 @@ class HookMode(unittest.TestCase):
         r = self.run_hook(json.dumps({**self.payload, "hook_event_name": "UserPromptSubmit"}))
         self.assertIn("SPOKEN", r.stdout)
 
+    def test_says_the_project_only_when_another_session_spoke_last(self):
+        (Path(self.env["CLAUDE_VOICE_DIR"]) / "enabled").touch()
+        mine = json.dumps(self.payload)
+        other = json.dumps({**self.payload, "session_id": "ffffffff-0000", "cwd": "/somewhere/otherProject"})
+        said = []
+        for who in (mine, mine, other, other, mine):
+            self.assertSilentExit0(self.run_hook(who))
+            said.append(self.last.read_text().split(":")[0] if self.last.read_text().startswith("From ") else "")
+        self.assertEqual(said, ["", "", "From otherProject", "", "From voiceLoop"])
+
+    def test_a_phone_turn_never_gets_the_project_prefix(self):
+        t, sid = self.phone_turn()
+        (t / "claude-voice.speaker").write_text("ffffffff-0000")
+        self.run_hook(json.dumps(self.payload))
+        self.assertTrue((t / f"claude-talk.reply.{sid}").read_text().startswith("It worked."))
+
     def notification(self, kind="permission_prompt", **more):
         return json.dumps({"hook_event_name": "Notification", "session_id": self.payload["session_id"],
                            "cwd": "/somewhere/myProject", "message": "Claude needs your permission to use Bash",

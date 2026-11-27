@@ -1067,7 +1067,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if u.path == "/api/again":
             return self.reply(200, json.dumps({"ok": talk.say_again()}).encode())
         if u.path == "/api/start":
-            client = urllib.parse.parse_qs(u.query).get("c", [""])[0]
+            q = urllib.parse.parse_qs(u.query)
+            client = q.get("c", [""])[0]
+            if q.get("m", [""])[0] in ("raw", "processed"):      # for reading the log later: which mic mode heard this
+                vl.log(f"talk: mic {q['m'][0]}")
             talk.start(client if CLIENT_ID.fullmatch(client) else "")
             return self.reply(204)
         self.refuse(404, "not found")
@@ -1145,6 +1148,7 @@ PAGE = r"""<!doctype html>
   #heard.hold { color: #cc8; }
   #why { color: #888; font-size: 14px; min-height: 1.4em; }
   #info { color: #666; font-size: 13px; margin-top: 22px; white-space: pre-wrap; }
+  #mic { color: #888; font-size: 13px; margin-top: 18px; text-decoration: underline; }
 </style></head><body>
 <button id="go">Tap once to start</button>
 <button id="mute">Mute my mic</button>
@@ -1155,6 +1159,7 @@ PAGE = r"""<!doctype html>
 <div class="bar"><i id="lvl"></i></div>
 <div id="heard"></div>
 <div id="why"></div>
+<div id="mic"></div>
 <div id="info"></div>
 <script>
 const $ = id => document.getElementById(id);
@@ -1170,6 +1175,11 @@ const WHY = { send: 'sent to Claude', command: 'command sent', cancelled: 'cance
   again: 'saying it again', noagain: 'nothing to say again yet: no reply has played since the server started' };
 let ctx = null, stream = null, timer = null, out = [], muted = false, quietUntil = 0, server = 'idle', lost = false, busy = false, info = [];
 let playing = false, source = null, again = false;
+// Mic mode, remembered on this device. "processed": the browser cleans the sound (noise
+// suppression, automatic gain). "raw": neither, which can keep the first word of a sentence
+// intact for speech recognition. Echo cancelling stays on in both.
+let raw = false; try { raw = localStorage.getItem('mic') === 'raw'; } catch (e) {}
+const micLabel = () => { $('mic').textContent = 'Mic: ' + (raw ? 'raw' : 'processed by the phone') + ' (tap to switch)'; };
 
 const note = t => { info.push(new Date().toLocaleTimeString() + ' ' + t); $('info').textContent = info.slice(-5).join('\n'); };
 function show() {
@@ -1274,7 +1284,9 @@ function hangUp(why) {       // the mic is gone (page was hidden, or the track e
 $('go').onclick = async () => {
   $('go').disabled = true;
   if (ctx) { await fetch('/api/start?c=' + CLIENT, { method: 'POST' }).catch(() => {}); busy = false; $('go').textContent = 'On. Just talk'; show(); return; }
-  try { stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, channelCount: 1 } }); }
+  try { stream = await navigator.mediaDevices.getUserMedia({ audio: raw
+    ? { echoCancellation: true, noiseSuppression: false, autoGainControl: false, channelCount: 1 }
+    : { echoCancellation: true, noiseSuppression: true, channelCount: 1 } }); }
   catch (e) { $('state').textContent = 'No microphone'; $('why').textContent = micProblem(e); $('go').disabled = false; return; }
   $('why').textContent = '';
   ctx = new (window.AudioContext || window.webkitAudioContext)();
@@ -1299,10 +1311,15 @@ $('go').onclick = async () => {
     catch (e) { /* the event stream reports a lost server */ }
     show();
   }, 200);
-  await fetch('/api/start?c=' + CLIENT, { method: 'POST' }).catch(() => {});
+  await fetch('/api/start?c=' + CLIENT + '&m=' + (raw ? 'raw' : 'processed'), { method: 'POST' }).catch(() => {});
   $('go').textContent = 'On. Just talk'; $('mute').style.display = 'block';
-  keepAwake(); note('mic open at ' + ctx.sampleRate + ' Hz'); show();
+  keepAwake(); note('mic open at ' + ctx.sampleRate + ' Hz, ' + (raw ? 'raw' : 'processed')); show();
 };
+$('mic').onclick = () => {
+  raw = !raw; try { localStorage.setItem('mic', raw ? 'raw' : 'processed'); } catch (e) {}
+  micLabel(); if (ctx) hangUp('mic mode changed: tap to start again');
+};
+micLabel();
 $('act').onclick = () => {
   const what = $('act').textContent;
   if (what === 'Skip') hush();                     // playReply() then reports "played", and the mic opens

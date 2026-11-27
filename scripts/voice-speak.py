@@ -336,6 +336,22 @@ def speak(text: str, cfg: dict, sid: str = "", reply: bool = True) -> None:
     pid_file().write_text(str(p.pid))
 
 
+def from_project(text: str, sid: str, cwd) -> str:
+    """With several sessions speaking, say whose reply this is: "From <project>: …", but
+    only when a DIFFERENT session spoke last. One session alone never hears its name."""
+    mark = tmp_dir() / "claude-voice.speaker"
+    try:
+        last = mark.read_text().strip()
+    except OSError:
+        last = ""
+    try:
+        mark.write_text(sid)
+    except OSError:
+        pass
+    name = re.sub(r"[^A-Za-z0-9 ._-]", " ", Path(cwd).name).strip() if isinstance(cwd, str) else ""
+    return f"From {name}: {text}" if sid and last and last != sid and name else text
+
+
 # --- the Talk page (voice-talk.py): a turn that came from the phone is answered there ----
 PHONE_TURN_MAX = 900     # seconds: an older marker is a turn that never got its reply
 
@@ -482,7 +498,7 @@ def hook_main(dry_run: bool = False) -> None:
     elif phone_turn(sid):
         to_phone(text, sid)
     elif text:
-        speak(text, cfg, sid)
+        speak(from_project(text, sid, payload.get("cwd")), cfg, sid)
 
 
 # --- CLI mode -----------------------------------------------------------------

@@ -194,6 +194,34 @@ class Clean(unittest.TestCase):
         # 40 s later: the held text expired (>30 s), the window closed (230), no wake word
         self.assertEqual(g.feed("also tomorrow", 260)[0], "ignore")
 
+    def test_hang_on_keeps_the_sentence_and_listens_on(self):
+        g = self.gate()
+        self.assertEqual(g.feed("Claude, open the settings file, hang on.", 100), ("hold", "open the settings file"))
+        # the rest needs no wake word, and the phrase itself is never sent
+        self.assertEqual(g.feed("and run the tests.", 110), ("send", "open the settings file and run the tests."))
+        self.assertEqual(g.pending, "")
+
+    def test_hang_on_alone_just_keeps_the_window_open(self):
+        g = self.gate()
+        self.assertEqual(g.feed("Claude, hold on.", 100), ("hold", ""))
+        self.assertEqual(g.feed("What time is it?", 120), ("send", "What time is it?"))
+        g = self.gate()
+        self.assertEqual(g.feed("Hang on.", 100)[0], "ignore")             # no wake word: still nobody's business
+
+    def test_hang_on_inside_a_sentence_is_only_words(self):
+        for said in ("We're going to hold on the desktop app.", "Hang on to that idea for later.",
+                     "Give me a second opinion on this."):
+            self.assertIsNone(vl.held_back(said), said)
+            self.assertEqual(self.gate(False).feed(said, 0), ("send", said))
+        for said, kept in (("Check the logs. Hang on!", "Check the logs"), ("Let me think.", ""),
+                           ("Rename it to, one moment", "Rename it to")):
+            self.assertEqual(vl.held_back(said), kept, said)
+
+    def test_held_text_from_hang_on_expires_like_any_other(self):
+        g = self.gate()
+        g.feed("Claude, open the settings file, hang on.", 100)
+        self.assertEqual(g.feed("and run the tests.", 140)[0], "ignore")   # 40 s later: window and held text are gone
+
     def test_gate_hold_continues_past_window(self):
         g = self.gate()
         g.replied(0)

@@ -51,6 +51,9 @@ record ─► transcribe ─► clean + decide ─► type into the pane ─► 
 - **Recording:** its own endpointing on 30 ms frames. A recording starts when the loudness passes the
   `threshold`, keeps 0.5 s of *pre-roll* (so soft first syllables aren't clipped), and ends after
   `silence_seconds` (2.5) of quiet. The installer measures your room to pick the threshold.
+- **"Hang on":** an utterance that ends with "hang on", "hold on", "one moment", "one second",
+  "give me a second" or "let me think" is held instead of sent (the same mechanism as a sentence
+  ending on "and…"), and what follows needs no wake word. Inside a sentence the words are just words.
 - **Transcription:** `whisper-cli` with the `small.en` model (about 0.5–0.9 s per sentence on
   Apple silicon; in a test on real speech it got 2 of 44 words wrong, against 6 for `base.en`) plus
   **Silero VAD**. `./install.sh --whisper=base` uses the smaller, faster `base.en` instead. The VAD drops
@@ -316,4 +319,5 @@ Security notes for the Talk page:
 - English (`base.en`). Other languages would need a multilingual Whisper model.
 - In the desktop app, voice reaches only the session that ran `/voice-app` (no "switch to").
 - One "last spoken" marker is shared by all sessions: if two voiced sessions finish at the same time,
-  the newer reply cuts off the older one.
+  the newer reply cuts off the older one. (A reply does say "From *project*:" when a different
+  session spoke last.)

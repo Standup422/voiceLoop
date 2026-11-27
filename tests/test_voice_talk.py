@@ -961,6 +961,14 @@ class Http(unittest.TestCase):
         self.assertEqual(self.req("POST", "/api/start?c=../x", b"")[0], 204)             # no id: nothing taken
         self.assertEqual(self.talk.owner, "visible-tab")
 
+    def test_the_page_can_say_which_mic_mode_it_uses(self):
+        self.assertEqual(self.req("POST", "/api/start?c=tab-1&m=raw", b"")[0], 204)
+        self.assertEqual(self.req("POST", "/api/start?c=tab-1&m=nonsense", b"")[0], 204)
+        self.assertEqual(self.talk.owner, "tab-1")
+        page = self.req("GET", "/")[1].decode()
+        self.assertIn("noiseSuppression: false, autoGainControl: false", page)
+        self.assertEqual(page.count("echoCancellation: true"), 2, "echo cancelling stays on in both modes")
+
     def test_interrupt_and_again_with_nothing_to_act_on(self):
         self.assertEqual(json.loads(self.req("POST", "/api/interrupt", b"")[1]), {"verdict": "idle"})
         self.assertEqual(json.loads(self.req("POST", "/api/again", b"")[1]), {"ok": False})
