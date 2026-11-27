@@ -29,9 +29,18 @@ Live state (logs, PID files) lives in the per-user temp dir (`$TMPDIR`).
 > If speech inherited the hook's output pipe, Claude Code would wait for the pipe to close,
 > which means it would wait for the speech to end. Detaching lets the turn end at once.
 
-The `UserPromptSubmit` hook does two things: it stops speech still playing when you send a message,
+The `UserPromptSubmit` hook does two things: it stops the session's own speech if it is still playing when you send a message,
 and when the message came from the listener, it adds a note asking Claude to open with 1–3 plain
 sentences.
+
+**One voice at a time.** A session's new reply replaces its own older speech. A reply from a
+*different* session never cuts the speaker off: it waits in a line (`$TMPDIR/claude-voice.queue/`,
+one waiting reply per session, the newest) and a small detached helper speaks the line in order
+once the speaker has finished. The hook itself still returns at once. A reply that has waited
+more than 60 seconds is dropped, since you have read it by then. When a different session spoke
+last, a reply starts with "From *project*:". `voice stop` silences the speaker and empties the
+line; sending a message in a session stops that session's own speech and drops its waiting reply,
+and leaves another session's reply alone.
 
 The `Notification` hook (matcher `permission_prompt|elicitation_dialog`) says one fixed line when
 Claude is waiting on you: "Claude is asking for permission in *project*." Claude Code sends it
@@ -318,6 +327,5 @@ Security notes for the Talk page:
   works via `/voice-app`.
 - English (`base.en`). Other languages would need a multilingual Whisper model.
 - In the desktop app, voice reaches only the session that ran `/voice-app` (no "switch to").
-- One "last spoken" marker is shared by all sessions: if two voiced sessions finish at the same time,
-  the newer reply cuts off the older one. (A reply does say "From *project*:" when a different
-  session spoke last.)
+- Two voiced sessions that finish in the very same instant can still overlap (see "One voice at
+  a time" above: the line is checked when a reply arrives, not locked).

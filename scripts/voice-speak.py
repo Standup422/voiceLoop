@@ -27,6 +27,10 @@
 #          $TMPDIR/claude-voice.<session_id> (one session). Never blocks a turn:
 #          prints nothing, always exits 0, speech runs detached with its output
 #          to /dev/null (an inherited pipe would make Claude Code wait).
+#          One voice at a time. A session's new reply replaces its own older one; a reply
+#          from a DIFFERENT session waits in $TMPDIR/claude-voice.queue/ until the speaker
+#          has finished (one waiting reply per session, dropped after 60 s), and a small
+#          detached helper (`--drain`) speaks the line in order.
 #          Installed to ~/.claude/hooks/ by install.sh (repo: voiceLoop, docs/HOW-IT-WORKS.md).
 #          Lessons: [[A voice loop for Claude Code]], [[One mic, many sessions — routing voice to Claude panes]], [[Stop hooks]].
 
@@ -276,37 +280,165 @@ def clean_for_speech(md: str, mode: str = "first_paragraph", max_chars: int = 60
 
 
 # --- speaking -----------------------------------------------------------------
-def stop_speech() -> bool:
-    """Kill the current speech, if any. Checks the PID really is a speech process
-    first: PIDs get reused, and we must never kill something else."""
-    pf = pid_file()
+def speech_pid() -> int:
+    """The PID of the speech playing right now, or 0. Checks the PID really is a speech
+    process: PIDs get reused, and we must never wait for (or kill) something else."""
     try:
-        pid = int(pf.read_text().strip())
-    except (OSError, ValueError):
-        return False
-    killed = False
-    try:
+        pid = int(pid_file().read_text().strip())
         comm = subprocess.run(["ps", "-p", str(pid), "-o", "comm="],
                               capture_output=True, text=True, timeout=2).stdout.strip()
         args = subprocess.run(["ps", "-p", str(pid), "-o", "args="],
                               capture_output=True, text=True, timeout=2).stdout
-        # say/afplay by name; the Kokoro speaker runs as uv -> python, so match its script
-        if Path(comm).name in SPEECH_PROCS or "voice-kokoro" in args:
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return 0
+    # say/afplay by name; the Kokoro speaker runs as uv -> python, so match its script
+    return pid if Path(comm).name in SPEECH_PROCS or "voice-kokoro" in args else 0
+
+
+def stop_speech() -> bool:
+    """Kill the current speech, if any. Replies waiting in the line are left alone: see
+    drop_waiting()."""
+    pid, killed = speech_pid(), False
+    if pid:
+        try:
             os.killpg(pid, signal.SIGTERM)  # start_new_session made it a group leader
             killed = True
-    except (OSError, subprocess.SubprocessError):
-        pass
-    try:
-        pf.unlink()
-    except OSError:
-        pass
+        except OSError:
+            pass
+    for f in (pid_file(), owner_file()):
+        try:
+            f.unlink()
+        except OSError:
+            pass
     return killed
 
 
-def speak(text: str, cfg: dict, sid: str = "", reply: bool = True) -> None:
+# --- the line: a reply from another session waits until the speaker has finished ----------
+QUEUE_MAX_WAIT = 60      # seconds: a reply that waited longer is dropped (you have read it by then)
+
+
+def owner_file() -> Path:
+    """Whose speech pid_file() is: a session id ("" for a test sample or an announcement)."""
+    return tmp_dir() / "claude-voice.owner"
+
+
+def queue_dir() -> Path:
+    return tmp_dir() / "claude-voice.queue"
+
+
+def other_speaker(sid: str) -> bool:
+    """True while a DIFFERENT session's reply is being spoken."""
+    try:
+        owner = owner_file().read_text().strip()
+    except OSError:
+        return False
+    return bool(owner) and owner != sid and speech_pid() != 0
+
+
+def enqueue(sid: str, text: str, cwd) -> None:
+    """One waiting reply per session: a newer one replaces the older. Written whole, then renamed."""
+    d = queue_dir()
+    d.mkdir(exist_ok=True)
+    tmp = d / f".{sid}.{os.getpid()}.tmp"
+    tmp.write_text(json.dumps({"text": text, "cwd": cwd if isinstance(cwd, str) else "", "at": time.time()}))
+    os.replace(tmp, d / f"{sid}.json")
+
+
+def drop_waiting(sid: str = "") -> int:
+    """Take a session's reply out of the line (it typed a new message, or its voice went off);
+    with no session, empty the whole line (`voice stop`, `voice off`). Returns how many."""
+    n = 0
+    for f in queue_dir().glob(f"{sid}.json" if sid else "*.json"):
+        try:
+            f.unlink()
+            n += 1
+        except OSError:
+            pass
+    return n
+
+
+def next_waiting():
+    """The reply that has waited longest, removed from the line: (sid, item) or None.
+    One that waited too long is dropped, but its listener is still told the turn is over."""
+    items = []
+    for f in queue_dir().glob("*.json"):
+        try:
+            items.append((json.loads(f.read_text()), f))
+        except (OSError, ValueError):
+            f.unlink(missing_ok=True)
+    for item, f in sorted(items, key=lambda x: x[0].get("at", 0)):
+        sid = safe_sid(f.stem)
+        f.unlink(missing_ok=True)
+        if not sid or not isinstance(item.get("text"), str):
+            continue
+        if time.time() - float(item.get("at", 0)) > QUEUE_MAX_WAIT:
+            try:
+                (tmp_dir() / f"claude-voice.spoke.{sid}").write_text("")
+            except OSError:
+                pass
+            continue
+        return sid, item
+    return None
+
+
+def start_drainer() -> None:
+    subprocess.Popen([str(Path(__file__).resolve()), "--drain"], stdin=subprocess.DEVNULL,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     start_new_session=True, close_fds=True)
+
+
+def drain() -> None:
+    """The helper behind the line (detached, so no hook ever waits): while somebody speaks,
+    wait; then speak the reply that has waited longest; exit when the line is empty.
+    Only one runs at a time (a lock file with its PID; a dead one's lock is taken over)."""
+    lock = queue_dir() / ".drain"
+    while True:
+        try:
+            fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.write(fd, str(os.getpid()).encode())
+            os.close(fd)
+        except FileExistsError:
+            try:
+                os.kill(int(lock.read_text().strip()), 0)
+                return                       # another helper is on it
+            except (OSError, ValueError):
+                lock.unlink(missing_ok=True)  # it died: take over
+                continue
+        except OSError:
+            return
+        try:
+            while True:
+                if speech_pid():
+                    time.sleep(0.2)
+                    continue
+                nxt = next_waiting()
+                if not nxt:
+                    break
+                sid, item = nxt
+                if is_enabled(sid):          # its voice may have been turned off while it waited
+                    speak(item["text"], load_config(), sid, cwd=item.get("cwd"), waited=True)
+        finally:
+            lock.unlink(missing_ok=True)
+        if not any(queue_dir().glob("*.json")):   # one that arrived while we were leaving
+            return
+
+
+def speak(text: str, cfg: dict, sid: str = "", reply: bool = True, cwd=None, waited: bool = False) -> None:
     """reply=False: an announcement, not Claude's reply. It is spoken the same way, but it
-    is not "the last reply", and it does not tell the listener that the reply has started."""
-    stop_speech()                 # one voice at a time: new speech replaces old
+    is not "the last reply", and it does not tell the listener that the reply has started.
+    A reply (with its session) never cuts off ANOTHER session's reply: it joins the line.
+    cwd: the session's folder, for "From <project>:". waited: called by drain()."""
+    if reply and sid and text and not waited and other_speaker(sid):
+        try:
+            enqueue(sid, text, cwd)
+            start_drainer()
+            return
+        except OSError:
+            pass                  # no line? then the old way: speak now
+    stop_speech()                 # one voice at a time: a session's new speech replaces its old
+    if reply and sid:
+        drop_waiting(sid)         # an older reply of ours still in the line is out of date
+        text = from_project(text, sid, cwd)   # decided when it is SPOKEN, so the order is the heard order
     try:
         if reply:
             last_file().write_text(text)
@@ -334,6 +466,7 @@ def speak(text: str, cfg: dict, sid: str = "", reply: bool = True) -> None:
     p.stdin.write(text.encode("utf-8"))   # stdin, not argv: text may start with "-"
     p.stdin.close()
     pid_file().write_text(str(p.pid))
+    owner_file().write_text(sid if reply else "")
 
 
 def from_project(text: str, sid: str, cwd) -> str:
@@ -376,6 +509,7 @@ def to_phone(text: str, sid: str) -> None:
     The Mac stays quiet for this turn. Written whole, then renamed. An empty reply is
     written too, so the page stops waiting."""
     stop_speech()
+    drop_waiting(sid)
     try:
         last_file().write_text(text)
         tmp = tmp_dir() / f"claude-talk.reply.{sid}.{os.getpid()}.tmp"
@@ -425,10 +559,18 @@ def listening_to(sid: str) -> bool:
 
 
 def prompt_submit(payload: dict) -> None:
-    """UserPromptSubmit: a new message ends any speech still playing (typing over
-    Samantha shuts her up), and in conversation mode it gets the short-answer note."""
-    stop_speech()
+    """UserPromptSubmit: a new message ends THIS session's speech if it is still playing
+    (typing over Samantha shuts her up; also a test sample or an announcement, which belong
+    to nobody), and in conversation mode it gets the short-answer note."""
     sid = safe_sid(payload.get("session_id"))
+    try:
+        owner = owner_file().read_text().strip()
+    except OSError:
+        owner = ""
+    if not owner or owner == sid:   # ANOTHER session's reply is not ours to cut off (found 2026-11-27:
+        stop_speech()               # a message sent in one tab silenced the reply of the other)
+    if sid:
+        drop_waiting(sid)         # this session moved on; other sessions' waiting replies still play
     if listening_to(sid) or phone_turn(sid, max_age=15):   # typed in by the listener, or by the Talk page just now
         print(json.dumps({"hookSpecificOutput": {
             "hookEventName": "UserPromptSubmit", "additionalContext": SPOKEN_CONTEXT}}))
@@ -498,7 +640,7 @@ def hook_main(dry_run: bool = False) -> None:
     elif phone_turn(sid):
         to_phone(text, sid)
     elif text:
-        speak(from_project(text, sid, payload.get("cwd")), cfg, sid)
+        speak(text, cfg, sid, cwd=payload.get("cwd"))
 
 
 # --- CLI mode -----------------------------------------------------------------
@@ -593,6 +735,13 @@ def _mtime_iso(path: Path):
         return None
 
 
+def _owner() -> str:
+    try:
+        return safe_sid(owner_file().read_text().strip())
+    except OSError:
+        return ""
+
+
 def status_snapshot() -> dict:
     """Machine-readable state for external tools (dashboards). Deliberately contains NO text:
     not what was heard (the listener log holds your words) and not what was spoken.
@@ -661,7 +810,10 @@ def status_snapshot() -> dict:
                      "engine": engine,
                      "voice": cfg.get("kokoro_voice") if engine == "kokoro" else (cfg.get("voice") or "default"),
                      "playingNow": playing, "lastSpokenAt": _mtime_iso(last_file()),
-                     "lastLatency": latency},
+                     "lastLatency": latency,
+                     # the line of waiting replies: whose turn it is and who waits (names only)
+                     "speaker": proj(_owner()) if playing and _owner() else None,
+                     "waiting": sorted(proj(f.stem) for f in queue_dir().glob("*.json"))},
         "listening": {"on": bool(lpid), "mode": mode, "target": target, "last": last or None},
         "projects": sorted({p.get("project") for p in panes.values() if p.get("project")}),
         "hooks": hooks,
@@ -692,6 +844,7 @@ def cli(args: list) -> int:
             for fl in tmp_dir().glob("claude-voice.*"):
                 if re.fullmatch(r"claude-voice\.[A-Za-z0-9-]{8,80}", fl.name):
                     fl.unlink(missing_ok=True)
+        drop_waiting()
         stop_speech()
         print("voice: OFF" + (" (all sessions)" if len(args) > 1 and args[1] == "all" else ""))
     elif cmd == "session":
@@ -700,14 +853,16 @@ def cli(args: list) -> int:
             return 1
         if len(args) > 1 and args[1] == "off":
             session_flag(sid).unlink(missing_ok=True)
+            drop_waiting(sid)
             stop_speech()
             print(f"voice: OFF for session {sid[:8]}")
         else:
             ensure_config()
             session_flag(sid).touch()
             print(f"voice: ON for session {sid[:8]} (until reboot or `voice session off`)")
-    elif cmd == "stop":
-        print("voice: stopped" if stop_speech() else "voice: nothing was playing")
+    elif cmd == "stop":   # silence means silence: the speaker AND whatever is waiting behind it
+        waiting = drop_waiting()
+        print("voice: stopped" if stop_speech() or waiting else "voice: nothing was playing")
     elif cmd == "status" and "--json" in args:
         print(json.dumps(status_snapshot()))
     elif cmd == "status":
@@ -760,6 +915,12 @@ def main() -> int:
         args = ["status"]        # bare `voice` = status; the hook runs as voice-speak.py
     if args and args[0] == "--dry-run":
         hook_main(dry_run=True)  # debugging: let errors show
+        return 0
+    if args and args[0] == "--drain":   # the helper behind the line of waiting replies (see drain())
+        try:
+            drain()
+        except Exception:
+            pass
         return 0
     if not args:
         try:

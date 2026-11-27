@@ -125,8 +125,9 @@ In a Claude Code session:
 - Need a moment in the middle of a sentence? End with "**hang on**" (or "hold on", "one moment",
   "let me think"). What you said so far is kept, and the rest is joined to it; the phrase itself
   is never sent.
-- With several sessions speaking, a reply starts with "From *project*:" when a different session
-  spoke last, so you know who is talking.
+- With several sessions speaking, they take turns: a reply from another session waits until the
+  one speaking has finished, and starts with "From *project*:" so you know who is talking.
+  `voice stop` silences all of it.
 - Names it keeps getting wrong? `voice words add Zephyrine`, or `voice words fix cube control = kubectl`.
   Then `voice benchmark` (no mic needed) shows which words Whisper still misses.
 

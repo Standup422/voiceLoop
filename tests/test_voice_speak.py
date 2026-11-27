@@ -7,6 +7,7 @@ import importlib.util
 import sys
 sys.dont_write_bytecode = True  # never drop __pycache__ next to the scripts under test (~/.claude/hooks)
 import json
+import time
 import os
 import subprocess
 import sys
@@ -212,6 +213,147 @@ class HookMode(unittest.TestCase):
         (t / "claude-voice.speaker").write_text("ffffffff-0000")
         self.run_hook(json.dumps(self.payload))
         self.assertTrue((t / f"claude-talk.reply.{sid}").read_text().startswith("It worked."))
+
+    # --- the line: a reply never cuts off ANOTHER session's reply -------------------------
+    OTHER = "ffffffff-0000"
+
+    def speaker(self, owner):
+        """A process that looks like speech in progress (its args name the Kokoro speaker),
+        in its own process group, as real speech is: stopping it must not stop the tests."""
+        t = Path(self.env["TMPDIR"])
+        fake = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)", "voice-kokoro"],
+                                start_new_session=True)
+        self.addCleanup(fake.wait)
+        self.addCleanup(fake.kill)
+        (t / "claude-voice.pid").write_text(str(fake.pid))
+        (t / "claude-voice.owner").write_text(owner)
+        (t / "claude-voice.speaker").write_text(owner)
+        return t, fake
+
+    def until(self, check, secs=8.0):
+        end = time.time() + secs
+        while time.time() < end:
+            if check():
+                return True
+            time.sleep(0.05)
+        return False
+
+    def waiting(self, t):
+        return sorted(f.stem for f in (t / "claude-voice.queue").glob("*.json"))
+
+    def put_waiting(self, t, sid, text="Waiting reply.", age=0.0):
+        (t / "claude-voice.queue").mkdir(exist_ok=True)
+        (t / "claude-voice.queue" / f"{sid}.json").write_text(
+            json.dumps({"text": text, "cwd": "/somewhere/otherProject", "at": time.time() - age}))
+
+    def drain(self):
+        return subprocess.run([str(SCRIPT), "--drain"], capture_output=True, text=True, env=self.env, timeout=30)
+
+    def test_a_reply_waits_until_the_other_session_has_finished(self):
+        (Path(self.env["CLAUDE_VOICE_DIR"]) / "enabled").touch()
+        t, fake = self.speaker(self.OTHER)
+        sid = self.payload["session_id"]
+        self.assertSilentExit0(self.run_hook(json.dumps(self.payload)))      # returns at once: no hook ever waits
+        self.assertEqual(self.waiting(t), [sid])
+        self.assertIsNone(fake.poll(), "the other session's speech was not cut off")
+        self.assertFalse(self.last.exists())
+        self.assertFalse((t / f"claude-voice.spoke.{sid}").exists(), "the listener's mic stays closed while it waits")
+        fake.terminate()                                                      # the speaker has finished
+        self.assertTrue(self.until(lambda: (t / f"claude-voice.spoke.{sid}").exists()), "never spoken")
+        self.assertTrue(self.last.read_text().startswith("From voiceLoop: It worked."))
+        self.assertTrue(self.until(lambda: not (t / "claude-voice.queue" / ".drain").exists()), "the helper never left")
+        self.assertEqual(self.waiting(t), [])
+
+    def test_a_session_still_replaces_its_own_speech(self):
+        (Path(self.env["CLAUDE_VOICE_DIR"]) / "enabled").touch()
+        sid = self.payload["session_id"]
+        t, fake = self.speaker(sid)
+        self.put_waiting(t, sid, "An older reply of mine.")
+        self.run_hook(json.dumps(self.payload))
+        self.assertTrue(self.until(lambda: fake.poll() is not None, 3), "its own older speech keeps playing")
+        self.assertEqual(self.waiting(t), [], "nor is its older waiting reply spoken later")
+        self.assertTrue(self.last.read_text().startswith("It worked."))
+
+    def test_one_waiting_reply_per_session_the_newest(self):
+        (Path(self.env["CLAUDE_VOICE_DIR"]) / "enabled").touch()
+        t, _ = self.speaker(self.OTHER)
+        sid = self.payload["session_id"]
+        self.run_hook(json.dumps(self.payload))
+        self.run_hook(json.dumps({**self.payload, "last_assistant_message": "The newer answer."}))
+        self.assertEqual(self.waiting(t), [sid])
+        self.assertIn("The newer answer.", (t / "claude-voice.queue" / f"{sid}.json").read_text())
+
+    def test_sending_a_message_drops_only_that_sessions_waiting_reply(self):
+        sid = self.payload["session_id"]
+        t, fake = self.speaker(self.OTHER)
+        self.put_waiting(t, sid)
+        self.put_waiting(t, "eeeeeeee-1111")
+        self.run_hook(json.dumps({"hook_event_name": "UserPromptSubmit", "session_id": sid, "prompt": "hi"}))
+        self.assertEqual(self.waiting(t), ["eeeeeeee-1111"])
+        time.sleep(0.3)
+        self.assertIsNone(fake.poll(), "a message in one session must not silence ANOTHER session's reply")
+
+    def test_sending_a_message_silences_that_sessions_own_speech(self):
+        sid = self.payload["session_id"]
+        t, fake = self.speaker(sid)
+        self.run_hook(json.dumps({"hook_event_name": "UserPromptSubmit", "session_id": sid, "prompt": "hi"}))
+        self.assertTrue(self.until(lambda: fake.poll() is not None, 3), "typing over your own reply shuts it up")
+
+    def test_sending_a_message_silences_speech_that_belongs_to_nobody(self):
+        t, fake = self.speaker("")                       # a test sample, an announcement, or an older version's speech
+        self.run_hook(json.dumps({"hook_event_name": "UserPromptSubmit", "session_id": self.payload["session_id"]}))
+        self.assertTrue(self.until(lambda: fake.poll() is not None, 3))
+
+    def test_voice_stop_silences_the_speaker_and_empties_the_line(self):
+        t, fake = self.speaker(self.OTHER)
+        self.put_waiting(t, self.payload["session_id"])
+        self.put_waiting(t, "eeeeeeee-1111")
+        r = subprocess.run([str(SCRIPT), "stop"], capture_output=True, text=True, env=self.env, timeout=20)
+        self.assertIn("stopped", r.stdout)
+        self.assertTrue(self.until(lambda: fake.poll() is not None, 3))
+        self.assertEqual(self.waiting(t), [])
+
+    def test_the_line_is_spoken_in_the_order_it_formed(self):
+        t = Path(self.env["TMPDIR"])
+        (Path(self.env["CLAUDE_VOICE_DIR"]) / "enabled").touch()
+        self.put_waiting(t, "eeeeeeee-1111", "Second in line.", age=1)
+        self.put_waiting(t, self.OTHER, "First in line.", age=5)
+        self.drain()
+        self.assertEqual(self.waiting(t), [])
+        self.assertEqual((t / "claude-voice.speaker").read_text(), "eeeeeeee-1111")   # it spoke last
+        self.assertEqual(self.last.read_text(), "From otherProject: Second in line.")
+
+    def test_a_reply_that_waited_too_long_is_dropped_but_ends_the_wait(self):
+        t = Path(self.env["TMPDIR"])
+        (Path(self.env["CLAUDE_VOICE_DIR"]) / "enabled").touch()
+        self.put_waiting(t, self.OTHER, age=120)
+        self.drain()
+        self.assertEqual(self.waiting(t), [])
+        self.assertFalse(self.last.exists(), "not spoken")
+        self.assertTrue((t / f"claude-voice.spoke.{self.OTHER}").exists(), "its listener may open the mic again")
+
+    def test_a_session_whose_voice_went_off_while_waiting_stays_silent(self):
+        t = Path(self.env["TMPDIR"])
+        self.put_waiting(t, self.OTHER)
+        self.drain()
+        self.assertEqual(self.waiting(t), [])
+        self.assertFalse(self.last.exists())
+
+    def test_a_dead_helpers_lock_is_taken_over(self):
+        t = Path(self.env["TMPDIR"])
+        (Path(self.env["CLAUDE_VOICE_DIR"]) / "enabled").touch()
+        self.put_waiting(t, self.OTHER, "Still gets its turn.")
+        (t / "claude-voice.queue" / ".drain").write_text("999999")    # no such process
+        self.drain()
+        self.assertEqual(self.last.read_text(), "Still gets its turn.")
+
+    def test_status_shows_who_waits_to_speak_but_never_the_words(self):
+        t = Path(self.env["TMPDIR"])
+        self.put_waiting(t, self.OTHER, "PINEAPPLE-7731 a private sentence")
+        r = subprocess.run([str(SCRIPT), "status", "--json"], capture_output=True, text=True, env=self.env, timeout=20)
+        self.assertNotIn("PINEAPPLE", r.stdout)
+        sp = json.loads(r.stdout)["speaking"]
+        self.assertEqual((sp["waiting"], sp["speaker"]), ([self.OTHER[:8]], None))   # a session id's start when no project is known
 
     def notification(self, kind="permission_prompt", **more):
         return json.dumps({"hook_event_name": "Notification", "session_id": self.payload["session_id"],

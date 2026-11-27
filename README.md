@@ -94,6 +94,13 @@ the models (Hugging Face, GitHub) at install, and the voice's Python packages (P
 After that, speech recognition and the voice run offline. What leaves the Mac is what Claude Code
 already sends: your messages, now typed by voice.
 
+## Your own dashboard
+
+voiceLoop reports its whole state with one command, `voice status --json` (never any text), and
+is steered by four more. [docs/DASHBOARD.md](docs/DASHBOARD.md) explains them, and
+[`examples/voice-dashboard.py`](examples/voice-dashboard.py) is a working one-file example:
+which session has the microphone, a button to move it, buttons to make it quiet.
+
 ## Tests
 
 ```bash
