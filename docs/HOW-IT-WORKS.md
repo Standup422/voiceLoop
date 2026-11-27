@@ -245,6 +245,8 @@ page: state, what was heard                    <--events- (server-sent events)
   for phones, only after `voice talk setup` has made a certificate. A phone's browser gives a page
   the microphone only over HTTPS it trusts, so the phone must trust your Mac's own certificate
   authority (`voice talk ca` shows how).
+- **Two QR codes.** `voice talk qr` is only the page's address, so a paired phone never has to
+  type it; it lets nobody in. The pairing code below is the one that holds a secret.
 - **Pairing.** `voice talk pair` shows a QR code with a one-time secret (10 minutes, one phone).
   The phone trades it for a long random token in a cookie. Only hashes are stored on the Mac
   (`~/.local/share/voiceloop/talk/phones.json`). From the network, nothing but a text-free status

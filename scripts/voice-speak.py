@@ -458,7 +458,7 @@ USAGE = """usage: voice on | off | session [on|off] | stop | status | test [text
   snippets [add <name> = <text> | remove <name>]   say "snippet <name>" to send the text
   quiet [on|off]   a lower mic threshold for a soft voice (from the next recording)
   talk          Talk page: a browser or a paired phone as mic + speaker (voice-talk.py)
-                talk setup | talk ca | talk pair [--open] | talk phones | talk unpair <name>|all
+                talk setup | talk ca | talk pair [--open] | talk qr [--open] | talk phones | talk unpair <name>|all
   setup         interactive first-run wizard (run it in a terminal window)
   benchmark     score the Whisper models on computer-spoken sentences, no mic needed
                 [--models base,small] [--noise] [--quick] [--show] [--json]

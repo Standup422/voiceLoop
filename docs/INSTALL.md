@@ -155,8 +155,9 @@ Now pair the phone. Pairing is what lets it in: being on your Wi-Fi is not enoug
 
 | Command | What it does |
 |---|---|
-| `/voice-talk` | start the server for this session's project (it stops when the session ends) |
+| `/voice-talk` | start the server for this session's project (it stops when the session ends); shows a QR code of the page's address for a paired phone |
 | `/voice-talk pair` | QR code to pair one more phone |
+| `voice talk qr` | that QR code again, in the terminal (`--open`: in a window). Only the address, no secret |
 | `/voice-talk phones` | list paired phones |
 | `/voice-talk off` | stop the server |
 | `voice talk unpair <name>` | forget a phone at once (`all` forgets every phone) |

@@ -6,7 +6,9 @@ import importlib.util
 import sys
 sys.dont_write_bytecode = True  # never drop __pycache__ next to the scripts under test
 import array
+import contextlib
 import http.client
+import io
 import json
 import math
 import os
@@ -855,6 +857,48 @@ class Pairing(unittest.TestCase):
         self.assertNotIn(token, stored)
         self.assertEqual((vt.talk_dir() / "phones.json").stat().st_mode & 0o777, 0o600)
         self.assertEqual(vt.talk_dir().stat().st_mode & 0o777, 0o700)
+
+    def _qr_cli(self, cert=True, show=False):
+        """Run qr_cli with a fake qrencode and `open`; returns (exit code, what was made)."""
+        made = []
+        d = Path(tempfile.mkdtemp(prefix="voiceloop-test-qr-"))
+        if cert:
+            (d / "cert.pem").write_text("x"), (d / "key.pem").write_text("x")
+        old = vt.cert_files, vt.qr, vt.subprocess.run, vt.host_name
+        vt.cert_files = lambda: (d / "cert.pem", d / "key.pem")
+        vt.qr = lambda text, png="": made.append(("png" if png else "terminal", text)) or True
+        vt.subprocess.run = lambda cmd, *a, **k: made.append(("ran", cmd[0]))
+        vt.host_name = lambda: "My-Mac"
+        try:
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                return vt.qr_cli(show), made
+        finally:
+            vt.cert_files, vt.qr, vt.subprocess.run, vt.host_name = old
+
+    def test_page_qr_is_only_the_address(self):
+        vt.redeem(vt.new_pairing(), "iPhone")
+        code, made = self._qr_cli()
+        url = f"https://my-mac.local:{vt.load_talk_config()['tls_port']}/"
+        self.assertEqual((code, made), (0, [("terminal", url)]))     # no secret, no window
+
+    def test_page_qr_in_a_window(self):
+        vt.redeem(vt.new_pairing(), "iPhone")
+        code, made = self._qr_cli(show=True)
+        self.assertEqual([m[0] for m in made], ["terminal", "png", "ran"])
+        self.assertEqual(made[2], ("ran", "open"))
+
+    def test_page_qr_does_not_open_a_pairing(self):
+        vt.redeem(vt.new_pairing(), "iPhone")
+        before = len(vt.phones())
+        self._qr_cli()
+        self.assertFalse((vt.talk_dir() / "pair.json").exists() and
+                         json.loads((vt.talk_dir() / "pair.json").read_text()))
+        self.assertEqual(len(vt.phones()), before)
+
+    def test_page_qr_needs_a_paired_phone_and_a_certificate(self):
+        self.assertEqual(self._qr_cli(), (1, []))                    # nobody paired: pair first
+        vt.redeem(vt.new_pairing(), "iPhone")
+        self.assertEqual(self._qr_cli(cert=False), (1, []))
 
     def test_tokens_that_are_not_paired(self):
         for t in ("", "nope", None):

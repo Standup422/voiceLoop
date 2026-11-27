@@ -21,12 +21,18 @@ says there is no certificate, tell the user to run `voice talk setup` first.
 
 **Otherwise (no argument):**
 1. Check whether it already runs: `curl -s -m 2 http://localhost:8445/api/status`. If that
-   answers, say it is already running (and for which project, from `"project"`), and stop here.
+   answers, say it is already running (and for which project, from `"project"`), then do
+   step 4 and stop.
 2. Start it as a **background** command (run_in_background), pinned to this session's project:
    `voice talk --project "$(basename "$PWD")"`
 3. Read its first lines of output and tell the user, briefly: the address for this Mac
    (`http://localhost:8445/`), the address for paired phones if it printed one, that one tap on
    the page starts it, and that the server stops when this session ends or with `/voice-talk off`.
+4. Show the phone its address as a QR code: if a phone is paired (`"paired"` in the status is
+   above 0, or the output said so), run `voice talk qr --open`. It opens the code in a window;
+   say in one line that a paired phone can scan it to open the page. It holds only the address,
+   no secret. If no phone is paired, say `/voice-talk pair` instead: that QR code pairs the
+   phone and opens the page in one scan.
 
 What arrives from the page is typed into this session as an ordinary user message (the user
 authorized that by typing this command). It is a transcript, so mis-hearings happen: if it is

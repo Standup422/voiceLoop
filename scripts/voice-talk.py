@@ -33,6 +33,7 @@
 #                                         authority on a phone (once per phone), with the steps
 #          voice-talk.py pair [--open]    one-time QR code / link that pairs ONE phone
 #                                         (10 minutes; --open shows the QR code in a window)
+#          voice-talk.py qr [--open]      the page's address as a QR code, for a paired phone
 #          voice-talk.py phones           list paired phones
 #          voice-talk.py unpair <name>|all   forget a phone (its token stops working at once)
 #          --local: this Mac only, even when a certificate exists.
@@ -1178,6 +1179,7 @@ def qr(text: str, png: str = "") -> bool:
     if not shutil.which("qrencode"):
         return False
     cmd = ["qrencode", "-o", png, "-s", "10", text] if png else ["qrencode", "-t", "ANSIUTF8", text]
+    sys.stdout.flush()               # our own lines first, also when the output is a pipe
     return subprocess.run(cmd).returncode == 0
 
 
@@ -1264,20 +1266,51 @@ This only ever sends the PUBLIC certificate. Serving for {seconds // 60} minutes
     return 0
 
 
-def pair_cli(show: bool) -> int:
+def phone_url(path: str = "", port: int = 0) -> str:
+    """The address a phone uses: https://<this-mac>.local:<tls port>/<path>."""
+    return f"https://{host_name().lower()}.local:{port or load_talk_config()['tls_port']}/{path}"
+
+
+def show_qr(url: str, png_name: str, window: bool) -> None:
+    """The QR code in the terminal, the link under it, and (window) the code in a window too:
+    a terminal QR code is no use when the output goes to Claude and not to a person."""
+    if not qr(url):
+        print("(no QR code: brew install qrencode)")
+    print(f"\n{url}\n")
+    if window:
+        png = str(talk_dir() / png_name)
+        if qr(url, png):
+            subprocess.run(["open", png])
+
+
+def have_cert() -> bool:
     cert, key = cert_files()
     if not (cert.exists() and key.exists()):
         print("No certificate yet: run voice talk setup first.", file=sys.stderr)
+        return False
+    return True
+
+
+def pair_cli(show: bool) -> int:
+    if not have_cert():
         return 1
-    url = f"https://{host_name().lower()}.local:{load_talk_config()['tls_port']}/pair?s={new_pairing()}"
     print(f"Pair ONE phone: scan this within {PAIR_SECONDS // 60} minutes (it works once).\n")
-    if not qr(url):
-        print("(no QR code: brew install qrencode)")
-    print(f"\n{url}\n\nThe server must be running (voice talk), and the phone on the same network.")
-    if show:
-        png = str(talk_dir() / "pair.png")
-        if qr(url, png):
-            subprocess.run(["open", png])
+    show_qr(phone_url(f"pair?s={new_pairing()}"), "pair.png", show)
+    print("The server must be running (voice talk), and the phone on the same network.")
+    return 0
+
+
+def qr_cli(show: bool) -> int:
+    """The Talk page's address as a QR code, for a phone that is ALREADY paired. Unlike the
+    pairing code it holds no secret: it is only the address, and lets nobody in by itself."""
+    if not have_cert():
+        return 1
+    if not phones():
+        print("No phone is paired yet: voice talk pair   (that QR code pairs it and opens the page)",
+              file=sys.stderr)
+        return 1
+    print("Open the Talk page on a paired phone: scan this.\n")
+    show_qr(phone_url(), "page.png", show)
     return 0
 
 
@@ -1298,6 +1331,8 @@ def main() -> int:
         return ca_cli()
     if sub == "pair":
         return pair_cli("--open" in sys.argv[2:])
+    if sub == "qr":
+        return qr_cli("--open" in sys.argv[2:])
     if sub == "phones":
         return phones_cli()
     if sub == "unpair":
@@ -1307,7 +1342,7 @@ def main() -> int:
     cfg, tcfg = vl.load_config(), load_talk_config()
     ap = argparse.ArgumentParser(description="voiceLoop Talk page: a browser or a paired phone as the "
                                              "microphone and speaker of the active Claude session",
-                                 epilog="other commands: setup | ca | pair [--open] | phones | unpair <name>|all")
+                                 epilog="other commands: setup | ca | pair [--open] | qr [--open] | phones | unpair <name>|all")
     ap.add_argument("--port", type=int, default=int(tcfg["port"]), help="plain HTTP, this Mac only")
     ap.add_argument("--tls-port", type=int, default=int(tcfg["tls_port"]), help="HTTPS for paired phones")
     ap.add_argument("--local", action="store_true", help="this Mac only, even if a certificate exists")
@@ -1325,15 +1360,16 @@ def main() -> int:
     except OSError as e:
         print(f"voice-talk: port {a.port} is not free ({e.strerror}). Try --port.", file=sys.stderr)
         return 1
-    servers, phone_line = [srv], "phones: off (voice talk setup makes the certificate)"
+    servers, phone_line, page_qr = [srv], "phones: off (voice talk setup makes the certificate)", ""
     cert, key = cert_files()
     if a.local:
         phone_line = "phones: off (--local)"
     elif cert.exists() and key.exists():
         try:
             servers.append(make_tls_server(talk, a.tls_port, cert, key))
-            phone_line = (f"phones: https://{host_name().lower()}.local:{a.tls_port}/  "
-                          f"({len(phones())} paired; pair one with: voice talk pair)")
+            phone_line = (f"phones: {phone_url(port=a.tls_port)}  "
+                          f"({len(phones())} paired; pair one with: voice talk pair; QR code: voice talk qr)")
+            page_qr = phone_url(port=a.tls_port) if phones() and sys.stdout.isatty() else ""
         except (OSError, ssl.SSLError) as e:
             phone_line = f"phones: off ({e})"
     for f in vl.tmp_dir().glob("claude-talk.turn.*"):   # turns a previous run was waiting on:
@@ -1345,6 +1381,8 @@ def main() -> int:
     signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
     print(f"voiceLoop Talk  (wake word: {'like the desk session' if a.wake is None else 'on' if a.wake else 'off'}; "
           f"Ctrl-C stops)\n  this Mac: http://localhost:{srv.server_address[1]}/\n  {phone_line}", flush=True)
+    if page_qr:                      # started by hand in a terminal: the paired phone just scans
+        qr(page_qr)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
