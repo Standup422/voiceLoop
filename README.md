@@ -76,7 +76,7 @@ the neural voice uses `kokoro-onnx`.
 
 - **`voice-speak.py`**, the mouth. A `Stop` hook takes the reply, cleans the markdown for the ear
   and speaks it in the background; a `UserPromptSubmit` hook asks for a short spoken opening and
-  stops any speech when you type. It's also the `voice` command.
+  stops any speech when you type; a `Notification` hook tells you when Claude is waiting for permission. It's also the `voice` command.
 - **`voice-listen.py`**, the ears. It records with its own endpointing, transcribes with
   whisper.cpp + Silero VAD (0.3–0.5 s), and types into the iTerm pane by session id, or, in the
   desktop app, hands the text back to the session that is listening for itself.

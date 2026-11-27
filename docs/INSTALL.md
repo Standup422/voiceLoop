@@ -173,7 +173,13 @@ How it behaves:
   hidden or the phone locks; the page keeps the screen on while it listens. Tap once to start again.
 - **While Claude works, and while the reply plays, nothing you say is sent.** A beep tells
   you it's your turn. "Stop listening" still works while Claude works.
-- **Permission prompts appear on the Mac,** not on the phone.
+- **Stop Claude:** while it works, say "**stop**" ("Claude, stop" in wake mode) or tap **Stop
+  Claude**. That presses Escape in its terminal pane, the same as at the desk. It works for
+  sessions in iTerm2, not for the desktop app.
+- **Skip and repeat:** while the reply plays, tap **Skip** to cut it short. Afterwards say
+  "**say that again**" or tap the button to hear it once more; that doesn't start a new turn.
+- **Permission prompts appear on the Mac,** not on the phone. The phone tells you: "Claude is
+  asking for permission in <project>." Answer at the desk, or say "stop" to decline and interrupt.
 - Say "stop listening" to end it.
 
 > **Keep the certificate authority to yourself.** `mkcert -CAROOT` shows a folder with a
@@ -217,7 +223,7 @@ rm -f ~/.claude/hooks/voice-{speak,listen,kokoro,talk}.py ~/.local/bin/voice \
       ~/.claude/commands/voice-{app,loop,talk}.md
 rm -rf ~/.local/share/voiceloop ~/.claude/voice
 ```
-Then remove the two `voice-speak.py` entries (under `Stop` and `UserPromptSubmit`) from
+Then remove the three `voice-speak.py` entries (under `Stop`, `UserPromptSubmit` and `Notification`) from
 `~/.claude/settings.json`. If nothing else has changed there since you installed, restore the backup the
 installer had you make (if you had a settings file before): `cp ~/.claude/settings.json.bak-voiceloop ~/.claude/settings.json`.
 

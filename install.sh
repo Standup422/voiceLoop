@@ -179,9 +179,9 @@ else
       sound_volume: 0.3, sound_volumes: { listening: 0.6 } } }' > "$cfg" && pass "config.json written (engine $engine, $( (( KOKORO )) && echo Emma || echo Samantha))"
 fi
 
-step "6. Hooks (Stop + UserPromptSubmit)"
+step "6. Hooks (Stop + UserPromptSubmit + Notification)"
 missing=()
-for ev in Stop UserPromptSubmit; do
+for ev in Stop UserPromptSubmit Notification; do
   cmd=$(jq -r --arg ev "$ev" '[.hooks[$ev][]?.hooks[]?.command | select(test("voice-speak.py"))][0] // empty' "$SETTINGS" 2>/dev/null)
   if [[ -z $cmd ]]; then missing+=("$ev"); continue; fi
   hp=${cmd%% *}; hp=${hp//\$HOME/$HOME}; hp=${hp/#\~/$HOME}   # the hook's own command, expanded
@@ -197,7 +197,9 @@ elif (( ${#missing[@]} )); then
   jq '.hooks.Stop = ((.hooks.Stop // []) + (if any(.hooks.Stop[]?.hooks[]?; .command|test("voice-speak")) then [] else
         [{"hooks":[{"type":"command","command":"$HOME/.claude/hooks/voice-speak.py","timeout":10}]}] end))
     | .hooks.UserPromptSubmit = ((.hooks.UserPromptSubmit // []) + (if any(.hooks.UserPromptSubmit[]?.hooks[]?; .command|test("voice-speak")) then [] else
-        [{"hooks":[{"type":"command","command":"$HOME/.claude/hooks/voice-speak.py","timeout":5}]}] end))' \
+        [{"hooks":[{"type":"command","command":"$HOME/.claude/hooks/voice-speak.py","timeout":5}]}] end))
+    | .hooks.Notification = ((.hooks.Notification // []) + (if any(.hooks.Notification[]?.hooks[]?; .command|test("voice-speak")) then [] else
+        [{"matcher":"permission_prompt|elicitation_dialog","hooks":[{"type":"command","command":"$HOME/.claude/hooks/voice-speak.py","timeout":10}]}] end))' \
     "$( [[ -f $SETTINGS ]] && echo "$SETTINGS" || echo "$merged.in")" > "$merged" && rm -f "$merged.in"
   fail "hooks not registered: ${missing[*]}"
   if [[ -f $SETTINGS ]]; then

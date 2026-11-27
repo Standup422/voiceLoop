@@ -9,7 +9,11 @@
 #          for speech (no code, tables, URLs or long paths), caps the length, and
 #          speaks it in the background with macOS `say`. Run with arguments, it is
 #          the `voice` CLI that toggles voice on and off.
-# Usage:   Hook:   registered under hooks.Stop in ~/.claude/settings.json (stdin = payload)
+#          As a Notification hook it says one fixed line when Claude is waiting on you
+#          (a permission prompt, a question dialog), so a long wait is not mistaken for work.
+# Usage:   Hook:   registered under hooks.Stop, hooks.UserPromptSubmit and hooks.Notification
+#                  (matcher "permission_prompt|elicitation_dialog") in ~/.claude/settings.json
+#                  (stdin = payload)
 #          CLI:    voice on | off | session [on|off] | stop | status | test [text]
 #                  voice listen [on|wake|off|status|switch <project>|once [--wake --json]]
 #                  voice setup   (interactive first-run wizard: mic, wake word, settings)
@@ -299,11 +303,14 @@ def stop_speech() -> bool:
     return killed
 
 
-def speak(text: str, cfg: dict, sid: str = "") -> None:
+def speak(text: str, cfg: dict, sid: str = "", reply: bool = True) -> None:
+    """reply=False: an announcement, not Claude's reply. It is spoken the same way, but it
+    is not "the last reply", and it does not tell the listener that the reply has started."""
     stop_speech()                 # one voice at a time: new speech replaces old
     try:
-        last_file().write_text(text)
-        if sid:   # tells THIS session's listener its reply has started (no text in it)
+        if reply:
+            last_file().write_text(text)
+        if sid and reply:   # tells THIS session's listener its reply has started (no text in it)
             (tmp_dir() / f"claude-voice.spoke.{sid}").write_text("")
     except OSError:
         pass
@@ -411,6 +418,42 @@ def prompt_submit(payload: dict) -> None:
             "hookEventName": "UserPromptSubmit", "additionalContext": SPOKEN_CONTEXT}}))
 
 
+# Fixed lines, never the notification's own text (it can name a command or a file).
+NOTICES = {"permission_prompt": "Claude is asking for permission{where}.",
+           "elicitation_dialog": "Claude has a question for you{where}."}
+
+
+def notice_text(payload: dict) -> str:
+    line = NOTICES.get(payload.get("notification_type"))
+    if not line:
+        return ""
+    cwd = payload.get("cwd")
+    name = re.sub(r"[^A-Za-z0-9 ._-]", " ", Path(cwd).name).strip() if isinstance(cwd, str) else ""
+    return line.format(where=f" in {name}" if name else "")
+
+
+def notify(payload: dict, dry_run: bool = False) -> None:
+    """Notification: Claude is waiting on the user (Claude Code sends this once the prompt
+    has waited a few seconds). Spoken only where the session's voice is on. A turn that
+    came from the phone hears it on the phone: voice-talk.py picks the line up from
+    claude-talk.notice.<session> and keeps waiting for the reply."""
+    text, sid = notice_text(payload), safe_sid(payload.get("session_id"))
+    if dry_run:
+        print(text)
+        return
+    if not text or not is_enabled(sid):
+        return
+    if phone_turn(sid):
+        try:
+            tmp = tmp_dir() / f"claude-talk.notice.{sid}.{os.getpid()}.tmp"
+            tmp.write_text(text)
+            os.replace(tmp, tmp_dir() / f"claude-talk.notice.{sid}")
+        except OSError:
+            pass
+    else:
+        speak(text, load_config(), sid, reply=False)
+
+
 def hook_main(dry_run: bool = False) -> None:
     raw = sys.stdin.read()
     payload = json.loads(raw) if raw.strip() else {}
@@ -418,6 +461,9 @@ def hook_main(dry_run: bool = False) -> None:
         return
     if payload.get("hook_event_name") == "UserPromptSubmit":
         prompt_submit(payload)
+        return
+    if payload.get("hook_event_name") == "Notification":
+        notify(payload, dry_run)
         return
     if not dry_run:
         try:
@@ -582,7 +628,8 @@ def status_snapshot() -> dict:
         settings = json.loads((Path.home() / ".claude" / "settings.json").read_text())
         reg = lambda ev: any("voice-speak.py" in h.get("command", "")   # noqa: E731
                              for g in settings.get("hooks", {}).get(ev, []) for h in g.get("hooks", []))
-        hooks = {"stop": reg("Stop"), "userPromptSubmit": reg("UserPromptSubmit")}
+        hooks = {"stop": reg("Stop"), "userPromptSubmit": reg("UserPromptSubmit"),
+                 "notification": reg("Notification")}
     except (OSError, ValueError, AttributeError):
         hooks = {}
     engine = cfg.get("engine", "say")

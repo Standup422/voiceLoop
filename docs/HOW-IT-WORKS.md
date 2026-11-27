@@ -4,7 +4,7 @@
 
 | File | Role |
 |---|---|
-| `scripts/voice-speak.py` | **The mouth** + the `voice` command. Registered as Claude Code's `Stop` and `UserPromptSubmit` hooks. |
+| `scripts/voice-speak.py` | **The mouth** + the `voice` command. Registered as Claude Code's `Stop`, `UserPromptSubmit` and `Notification` hooks. |
 | `scripts/voice-listen.py` | **The ears.** Records, transcribes, decides what to send, and sends it. |
 | `scripts/voice-kokoro.py` | Neural voice (Kokoro), sentence by sentence. Falls back to macOS `say`. |
 | `commands/voice-app.md` | The `/voice-app` slash command (desktop app mode). |
@@ -32,6 +32,11 @@ Live state (logs, PID files) lives in the per-user temp dir (`$TMPDIR`).
 The `UserPromptSubmit` hook does two things: it stops speech still playing when you send a message,
 and when the message came from the listener, it adds a note asking Claude to open with 1–3 plain
 sentences.
+
+The `Notification` hook (matcher `permission_prompt|elicitation_dialog`) says one fixed line when
+Claude is waiting on you: "Claude is asking for permission in *project*." Claude Code sends it
+once the prompt has waited a few seconds. It speaks only where the session's voice is on, and
+never reads the notification's own text aloud (that can name a command or a file).
 
 ## The ears: half-duplex conversation (iTerm2)
 
@@ -262,8 +267,17 @@ page: state, what was heard                    <--events- (server-sent events)
 - **One microphone at a time.** While a page streams, the desk microphone rests. With several
   pages open, the one tapped last talks.
 - **Half-duplex.** Nothing is sent while Claude works or while the reply plays. While Claude
-  works the page still listens for one thing, "stop listening"; anything else is shown as
-  "Claude is still working" and dropped, so talk in the room can't queue up messages.
+  works the page still listens for two things, "stop listening" and "stop"; anything else is
+  shown as "Claude is still working" and dropped, so talk in the room can't queue up messages.
+- **Stop Claude.** "Stop" as a whole utterance ("Claude, stop" in wake mode), or the page's
+  button, presses Escape in the pane Claude is working in. It can only interrupt: one fixed key,
+  never text, only while the page waits for a reply, and only into a pane that still runs
+  Claude. A session in the desktop app has no pane, so it can't be stopped from the page.
+  Claude Code runs no Stop hook for an interrupted turn, so the page stops waiting by itself.
+- **Skip and "say that again".** The page can cut a reply short, and replay the last one (the
+  text is kept in memory and made into audio again; no audio is stored). Neither starts a turn.
+- **Claude is waiting on you.** During a phone turn the `Notification` hook's line is played
+  on the page, and the page goes on waiting for the reply. The answer is given at the desk.
 - **Settings:** `"talk": {"port": 8445, "tls_port": 8444, "threshold": ""}` in `config.json`
   (`threshold`: the phone is a different microphone, so it can have its own).
 

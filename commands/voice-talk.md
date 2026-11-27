@@ -42,5 +42,10 @@ paragraph): that paragraph is what gets spoken on the page.
 
 **When the background command ends** on its own, say "The Talk server stopped." in one line.
 
+While you work, the user can say "stop" (or tap **Stop Claude**) on the page: that presses
+Escape in this pane, exactly as if they had pressed it at the desk. Treat it as that: stop, and
+wait for what they say next. "Say that again" and **Skip** only replay or cut the audio; you
+are not involved.
+
 Limits: one page talks at a time (the one tapped last). The page is deaf while you work and
-while the reply plays. Details: `docs/HOW-IT-WORKS.md` in the voiceLoop repo.
+while the reply plays, except for "stop" and "stop listening". Details: `docs/HOW-IT-WORKS.md` in the voiceLoop repo.

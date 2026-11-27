@@ -41,14 +41,18 @@
 #          session's mode (else "wake" in the "listen" settings). --cwd: whose word list
 #          to use while no session is found (<project>/.claude/voice.json).
 #          Spoken: "stop listening"; "command <name>" for names in the listener's allowlist
-#          (one that needs a yes is asked on the page: say yes).
+#          (one that needs a yes is asked on the page: say yes); "say that again" replays
+#          the last reply without a new turn; while Claude works, "stop" ("Claude, stop" in
+#          wake mode) presses Escape in its pane. The page has a button for each of these.
 #          Routes: GET /            the page
 #                  GET /api/status  {"running","project","paired","state","last_turn_at"}: NEVER text
-#                  GET /api/events  server-sent events: {"type":"state"|"heard"|"reply"|"ready"}
+#                  GET /api/events  server-sent events: {"type":"state"|"heard"|"reply"|"ready"|"notice"}
 #                  GET /api/reply/<id>/<n>.wav     one sentence of the reply (425 = not made yet)
 #                  POST /api/played?id=<id>        the page finished playing the reply
 #                  POST /api/audio?c=<client id>   raw PCM (16 kHz, 16-bit, mono, little-endian)
 #                  POST /api/stop | /api/start     end / resume the conversation
+#                  POST /api/interrupt             Escape into the pane Claude is working in
+#                  POST /api/again                 play the last reply once more
 # Deps:    stdlib; voice-listen.py in the same folder (and what it needs: whisper-cpp, the
 #          models). For phones: brew mkcert (certificate) and qrencode (QR codes).
 #          Settings: optional "talk" object in ~/.claude/voice/config.json:
@@ -62,7 +66,13 @@
 #          script touches $TMPDIR/claude-talk.live and voice-listen.py watches it.
 #          After a delivery nothing is sent until the reply has been played (half-duplex,
 #          like the desk). While Claude works, the page still listens for one thing, "stop
-#          listening"; anything else is shown as "Claude is still working" and dropped. If the page went away meanwhile, the reply is spoken on the Mac.
+#          listening" and "stop"; anything else is shown as "Claude is still working" and
+#          dropped. If the page went away meanwhile, the reply is spoken on the Mac.
+#          "stop" can only interrupt: it sends one fixed key (Escape), never text, only
+#          while this server waits for a reply, and only into a pane that still runs Claude.
+#          A session without a pane (the desktop app) cannot be stopped from here.
+#          A notice from the Notification hook (Claude is asking for permission) is spoken
+#          on the page while it waits; the answer is given at the desk.
 #          Reply audio lives in a temp folder only while it plays. Typing into iTerm needs the Automation permission of the app
 #          this server was started from. Not on the phone: "switch to <project>" (the
 #          phone follows the desk).
@@ -208,6 +218,42 @@ def deliver(target: dict, text: str, command=None) -> bool:
     return vl.send(target["iterm_session"], "/" + command[0] if command else text)
 
 
+# --- two things a phone can say that are not for Claude ---------------------------------
+# Whole utterances only (after the wake word): the words inside a longer sentence are speech.
+INTERRUPT = {"stop", "stop it", "stop that", "stop claude", "cancel", "cancel that", "abort"}
+AGAIN = {"say that again", "say it again", "repeat that", "one more time", "come again", "what was that"}
+
+
+def _plain(text: str) -> str:
+    return " ".join(re.sub(r"[^a-z ]", " ", text.lower()).split())
+
+
+def is_interrupt(text: str) -> bool:
+    return _plain(text) in INTERRUPT
+
+
+def is_again(text: str) -> bool:
+    """The phrase alone, or at the END after one or two words ("Let's say that again",
+    "can you repeat that"): a misheard wake word often lands there. Not when more follows."""
+    t = _plain(text)
+    return any(t == p or (t.endswith(" " + p) and len(t[:-len(p)].split()) <= 2) for p in AGAIN)
+
+
+def notice_file(claude_sid: str) -> Path:
+    """Written by the Notification hook (voice-speak.py) during a phone turn: one line to
+    say on the page while it waits, e.g. that Claude is asking for permission."""
+    return vl.tmp_dir() / f"claude-talk.notice.{claude_sid}"
+
+
+def take_notice(claude_sid: str) -> str:
+    try:
+        text = notice_file(claude_sid).read_text().strip()
+        notice_file(claude_sid).unlink()
+        return text[:300]
+    except OSError:
+        return ""
+
+
 # --- the reply: text from the Stop hook -> audio for the page --------------------------
 def await_reply(cfg: dict, sent_at: float, sid: str, gone=lambda: False):
     """Wait for this turn's reply. Returns its text; "" when there is nothing to play here
@@ -328,10 +374,11 @@ class Talk:
     stt is injectable, so the tests need no Whisper."""
 
     def __init__(self, cfg: dict, tcfg: dict | None = None, wake=None, cwd: str = "", stt=None,
-                 find=None, send=None, wait_reply=None, synth=None, say_mac=None, alive=None):
+                 find=None, send=None, wait_reply=None, synth=None, say_mac=None, alive=None, escape=None):
         """wake: True/False forces the mode; None copies the desk session's.
-        find / send / wait_reply / synth / say_mac / alive: find_target, deliver, await_reply,
-        synthesize, "speak on the Mac instead" and claude_in_pane; injectable for the tests."""
+        find / send / wait_reply / synth / say_mac / alive / escape: find_target, deliver,
+        await_reply, synthesize, "speak on the Mac instead", claude_in_pane and "press Escape
+        in that pane"; injectable for the tests."""
         self.cfg = dict(cfg)
         if (tcfg or {}).get("threshold"):
             self.cfg["threshold"] = tcfg["threshold"]
@@ -341,10 +388,15 @@ class Talk:
         self.prefer = ""             # --project: which pane rule 3 tries first
         self.send = send or deliver
         self.wait_reply = wait_reply or (lambda sent_at, sid: await_reply(
-            self.cfg, sent_at, sid, gone=lambda: self.stopped or self.closed))
+            self.cfg, sent_at, sid, gone=lambda: self.stopped or self.closed or self.cancelled))
         self.synth = synth or synthesize
         self.say_mac = say_mac or vl.say_local
         self.alive = alive or vl.claude_in_pane
+        self.escape = escape or vl.press_escape
+        self.working = None          # the session that is working on what we delivered (for interrupt())
+        self.cancelled = False       # interrupt() ended the wait for this turn's reply
+        self.last_reply = ""         # the text of the last reply played here (for "say that again")
+        self.again = False           # play last_reply once more (asked by voice or by the page)
         self.busy = False            # the worker is waiting for, or playing, a reply
         self.waiting_sid = ""        # the session whose reply we are waiting for
         self.reply = None            # {"id", "dir", "n", "done"}: the reply being played right now
@@ -391,7 +443,8 @@ class Talk:
         """Everything the page shows besides the words: state, wake mode, WHICH project it
         is talking to, and the page's build (an old tab reloads itself after an update)."""
         return {"type": "state", "state": self.state, "wake": self.gate.wake,
-                "project": (self.target or {}).get("project") or "", "build": BUILD}
+                "project": (self.target or {}).get("project") or "", "build": BUILD,
+                "again": bool(self.last_reply)}
 
     def set_state(self, state: str) -> None:
         with self.lock:
@@ -456,6 +509,45 @@ class Talk:
         self.played.set()
         release_voice()
         self.stream.close()
+
+    # --- stop Claude / say it again: by voice or by a button on the page ---------------
+    def interrupt(self, said: str = "") -> dict:
+        """Stop Claude in the middle of the turn we delivered: the Escape key into its pane,
+        the same as pressing Esc at the desk. It can only interrupt, never start anything:
+        one fixed key, only while we wait for a reply, only into a pane that still runs
+        Claude. verdict: interrupt | idle (nothing of ours is running) | cant."""
+        t = self.working
+        if not (self.busy and self.state == "thinking" and t) or self.cancelled:
+            return self._tell("idle", said)
+        if t.get("kind") != "iterm" or not self.alive(t.get("iterm_session", "")) \
+                or not self.escape(t["iterm_session"]):
+            return self._tell("cant", said)
+        self.cancelled = True            # an interrupted turn has no reply to wait for
+        vl.turn_file(t["claude_session"]).unlink(missing_ok=True)
+        return self._tell("interrupt", said)
+
+    def say_again(self) -> bool:
+        """The page's button. False = nothing to repeat, or not now (a turn is running)."""
+        if not self.last_reply or self.busy or self.stopped:
+            return False
+        self.again = True                # the worker picks it up (capture() is interrupted)
+        return True
+
+    def _replay(self) -> None:
+        self.again = False
+        if not self.last_reply or self.stopped:
+            return
+        self.busy = True
+        try:
+            self.speak_reply(self.last_reply)
+        except Exception as e:           # noqa: BLE001
+            vl.log(f"talk: the replay failed: {e!r}")
+        self.busy = False
+        self.gate.replied(time.time())
+        self.stream.clear()
+        self.publish({"type": "ready"})
+        if not self.stopped:
+            self.set_state("listening" if self.live() else "idle")
 
     # --- audio out: the reply ---------------------------------------------------------
     def speak_reply(self, text: str) -> None:
@@ -549,6 +641,7 @@ class Talk:
         self.sticky = (target, time.time())      # the conversation is with this session now
         expect = bool(command[1].get("reply", True)) if command else True
         self.sent = (target["claude_session"], time.time(), expect)
+        self.working = target
         return "command" if command else "send"
 
     def heard(self, text: str, now: float, target=False) -> dict:
@@ -557,7 +650,8 @@ class Talk:
         ask (a command that needs a spoken yes; the question is in "ask") | cancelled |
         hold (sounds unfinished) | ignore (no wake word) | yes (wake word alone) | stop |
         nowhere (no Claude session to deliver to) | busy (said while Claude was still working:
-        not sent; only the stop phrase counts then, see _await())"""
+        not sent; only the stop phrases count then, see _await()) | again (replay the last
+        reply; not sent) | noagain (nothing to replay yet)"""
         if target is False:
             target = self.resolve()
         ask = ""
@@ -571,6 +665,9 @@ class Talk:
         verdict, out = self.gate.feed(text, now)
         if verdict == "send" and vl.is_stop(out, self.cfg):
             verdict = "stop"
+        elif verdict == "send" and is_again(out):
+            verdict = "again" if self.last_reply else "noagain"
+            self.again = verdict == "again"      # run() plays it
         elif verdict == "send":
             command = vl.parse_command(out, self.cfg["commands"])
             if command and command[1].get("confirm") and target:
@@ -598,13 +695,16 @@ class Talk:
         """capture() asks this every ~90 ms. Also the place where a client that went away is noticed."""
         if self.state == "listening" and not self.live():
             self.set_state("idle")
-        return self.stopped or self.closed
+        return self.stopped or self.closed or self.again
 
     def _await(self, sent_at: float, sid: str, wav: str, cwd: str):
-        """Wait for the reply, and meanwhile keep listening for ONE thing: the stop phrase.
-        (A long task used to leave the phone deaf for minutes, with no way out.) Anything
-        else said now is shown as "busy" and NOT sent: a TV in the room must not queue up
-        messages for Claude. Returns what wait_reply returns."""
+        """Wait for the reply, and meanwhile keep listening for TWO things: "stop listening"
+        (ends the conversation) and "stop" (interrupts Claude; in wake mode it needs the
+        wake word). (A long task used to leave the phone deaf for minutes, with no way
+        out.) Anything else said now is shown as "busy" and NOT sent: a TV in the room must
+        not queue up messages for Claude. A notice from the Notification hook (Claude is
+        asking for permission) is spoken on the page meanwhile. Returns what wait_reply
+        returns; None after an interrupt."""
         box = []
 
         def wait():
@@ -616,10 +716,19 @@ class Talk:
         th = threading.Thread(target=wait, daemon=True)
         th.start()
         self.stream.clear()
-        while th.is_alive() and not (self.stopped or self.closed):
+        over = lambda: not th.is_alive() or self.stopped or self.closed or self.cancelled  # noqa: E731
+        while not over():
+            notice = take_notice(sid)
+            if notice:
+                self.publish({"type": "notice", "text": notice})
+                self.speak_reply(notice)
+                if not (self.stopped or self.closed):
+                    self.set_state("thinking")
+                self.stream.clear()
+                continue
             status, pcm = vl.capture(self.stream, self.cfg,
-                                     interrupted=lambda: not th.is_alive() or self.stopped or self.closed)
-            if status != "ok" or not th.is_alive():
+                                     interrupted=lambda: over() or notice_file(sid).exists())
+            if status != "ok" or over():
                 continue
             try:
                 vl.write_wav(wav, pcm)
@@ -627,12 +736,17 @@ class Talk:
             except Exception as e:   # noqa: BLE001
                 vl.log(f"talk: utterance failed: {e!r}")
                 continue
-            if not text or not th.is_alive():
+            if not text or over():
                 continue
-            said = vl.strip_wake(text, self.gate.extra)[0]
-            self._tell("stop" if vl.is_stop(said, self.cfg) else "busy", said)   # "stop" calls stop()
+            said, woke = vl.strip_wake(text, self.gate.extra)
+            if vl.is_stop(said, self.cfg):
+                self._tell("stop", said)                 # calls stop()
+            elif is_interrupt(said) and (woke or not self.gate.wake):
+                self.interrupt(said)
+            else:
+                self._tell("busy", said)
         th.join(3)
-        return box[0] if box else None
+        return None if self.cancelled else box[0] if box else None
 
     def run(self) -> None:
         with tempfile.TemporaryDirectory(prefix="voiceloop-talk-") as td:
@@ -640,6 +754,9 @@ class Talk:
             while not self.closed:
                 if self.stopped:
                     time.sleep(0.1)
+                    continue
+                if self.again:
+                    self._replay()
                     continue
                 status, pcm = vl.capture(self.stream, self.cfg, interrupted=self._interrupted)
                 if status != "ok" or self.stopped or self.closed:
@@ -657,16 +774,18 @@ class Talk:
                 if sent and not self.stopped:
                     # Half-duplex, as at the desk: deaf until the reply has been spoken.
                     sid, at, expect = sent
-                    self.busy, self.waiting_sid = True, sid
+                    self.busy, self.waiting_sid, self.cancelled = True, sid, False
+                    notice_file(sid).unlink(missing_ok=True)     # an old notice is not this turn's
                     self.set_state("thinking")
                     try:
                         text = self._await(at, sid, wav, (target or {}).get("cwd") or self.cwd) \
                             if expect else time.sleep(1.0)
                         if text and not self.stopped:
+                            self.last_reply = text
                             self.speak_reply(text)
                     except Exception as e:   # noqa: BLE001
                         vl.log(f"talk: the reply failed: {e!r}")
-                    self.busy, self.waiting_sid = False, ""
+                    self.busy, self.waiting_sid, self.working = False, "", None
                     self.gate.replied(time.time())   # a reply invites an answer
                     self.stream.clear()              # whatever the mic picked up meanwhile
                     self.publish({"type": "ready"})
@@ -943,6 +1062,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if u.path == "/api/stop":
             talk.stop()
             return self.reply(204)
+        if u.path == "/api/interrupt":
+            return self.reply(200, json.dumps({"verdict": talk.interrupt()["verdict"]}).encode())
+        if u.path == "/api/again":
+            return self.reply(200, json.dumps({"ok": talk.say_again()}).encode())
         if u.path == "/api/start":
             client = urllib.parse.parse_qs(u.query).get("c", [""])[0]
             talk.start(client if CLIENT_ID.fullmatch(client) else "")
@@ -1009,6 +1132,8 @@ PAGE = r"""<!doctype html>
   button:disabled { background: #333; color: #aaa; }
   #mute { display: none; margin-top: 10px; background: #345; color: #eee; }
   #mute.on { background: #a33; }
+  #act { display: none; margin-top: 10px; background: #345; color: #eee; }
+  #act.stop { background: #a33; }
   #state { font-size: 34px; font-weight: 700; margin: 34px 0 8px; }
   #mode { color: #888; font-size: 14px; min-height: 1.4em; }
   #who { color: #9cf; font-size: 16px; min-height: 1.4em; }
@@ -1023,6 +1148,7 @@ PAGE = r"""<!doctype html>
 </style></head><body>
 <button id="go">Tap once to start</button>
 <button id="mute">Mute my mic</button>
+<button id="act"></button>
 <div id="state">&ndash;</div>
 <div id="who"></div>
 <div id="mode"></div>
@@ -1038,9 +1164,12 @@ const LABEL = { idle: 'Ready', listening: 'Listening', transcribing: 'Got it…'
 const WHY = { send: 'sent to Claude', command: 'command sent', cancelled: 'cancelled', hold: 'sounds unfinished, go on…',
   ignore: 'heard, but ignored (no wake word)', yes: 'Yes?', stop: 'stopped listening',
   nowhere: 'not sent: no Claude session is active at the desk',
-  busy: 'not sent: Claude is still working. Say “stop listening” to end.' };
+  busy: 'not sent: Claude is still working. Say “stop” to interrupt it, “stop listening” to end.',
+  interrupt: 'stopped Claude', idle: 'Claude is not working on anything from here',
+  cant: 'could not stop Claude: this session has no terminal pane to press Escape in',
+  again: 'saying it again', noagain: 'nothing to say again yet: no reply has played since the server started' };
 let ctx = null, stream = null, timer = null, out = [], muted = false, quietUntil = 0, server = 'idle', lost = false, busy = false, info = [];
-let playing = false, source = null;
+let playing = false, source = null, again = false;
 
 const note = t => { info.push(new Date().toLocaleTimeString() + ' ' + t); $('info').textContent = info.slice(-5).join('\n'); };
 function show() {
@@ -1048,6 +1177,10 @@ function show() {
     : playing ? 'Talking' : muted ? 'Muted' : (LABEL[server] || server);
   if (busy && ctx) { $('why').textContent = 'It may be a forgotten tab in another window.'; $('go').disabled = false; $('go').textContent = 'Talk here instead'; }
   else if ($('go').textContent === 'Talk here instead') { $('why').textContent = ''; $('go').disabled = true; $('go').textContent = 'On. Just talk'; }
+  // One more button, and what it does follows the moment: stop Claude, skip the reply, or hear it again.
+  const act = !ctx || busy || lost ? '' : playing ? 'Skip' : server === 'thinking' ? 'Stop Claude'
+    : again && (server === 'listening' || server === 'idle') ? 'Say that again' : '';
+  $('act').style.display = act ? 'block' : 'none'; $('act').textContent = act; $('act').className = act === 'Stop Claude' ? 'stop' : '';
 }
 
 // Cue sounds on THIS device (the desk's cues play on the Mac, where nobody is). The mic is
@@ -1061,7 +1194,9 @@ function beep(freq, ms, when = 0) {
 }
 const accepted = () => { beep(660, 90); beep(990, 120, 0.1); };
 const cue = { send: accepted, command: accepted, yes: () => beep(880, 120), ask: () => beep(880, 120),
-  stop: () => { beep(440, 120); beep(330, 180, 0.13); }, cancelled: () => beep(330, 180), nowhere: () => beep(220, 300) };
+  stop: () => { beep(440, 120); beep(330, 180, 0.13); }, cancelled: () => beep(330, 180), nowhere: () => beep(220, 300),
+  interrupt: () => { beep(440, 120); beep(330, 180, 0.13); }, cant: () => beep(220, 300),
+  again: () => beep(880, 120), noagain: () => beep(220, 300), idle: () => beep(220, 300) };
 
 // The reply: one sound file per sentence, fetched as soon as the Mac has made it, played in
 // order. The mic is zeroed meanwhile, so Claude's voice is never heard as your next sentence.
@@ -1096,6 +1231,7 @@ es.onmessage = m => {
     if (e.build && e.build !== BUILD) { location.reload(); return; }   // the Mac has a newer page
     $('who').textContent = e.project ? 'Talking to: ' + e.project : '';
     server = e.state; $('mode').textContent = e.wake ? 'Start with “Claude, …”' : 'Every sentence counts';
+    again = !!e.again;
     if (e.state === 'stopped') hush();
     if (e.state === 'stopped' && ctx) { $('go').disabled = false; $('go').textContent = 'Tap to listen again'; }
   }
@@ -1103,6 +1239,7 @@ es.onmessage = m => {
     $('heard').textContent = e.text ? '“' + e.text + '”' : ''; $('heard').className = e.verdict;
     $('why').textContent = e.ask || WHY[e.verdict] || ''; if (cue[e.verdict]) cue[e.verdict]();
   }
+  if (e.type === 'notice') { $('heard').textContent = ''; $('why').textContent = e.text; }
   if (e.type === 'reply') playReply(e);
   if (e.type === 'ready') beep(520, 140);          // your turn
   show();
@@ -1165,6 +1302,11 @@ $('go').onclick = async () => {
   await fetch('/api/start?c=' + CLIENT, { method: 'POST' }).catch(() => {});
   $('go').textContent = 'On. Just talk'; $('mute').style.display = 'block';
   keepAwake(); note('mic open at ' + ctx.sampleRate + ' Hz'); show();
+};
+$('act').onclick = () => {
+  const what = $('act').textContent;
+  if (what === 'Skip') hush();                     // playReply() then reports "played", and the mic opens
+  else fetch(what === 'Stop Claude' ? '/api/interrupt' : '/api/again', { method: 'POST' }).catch(() => {});
 };
 $('mute').onclick = () => { muted = !muted; $('mute').textContent = muted ? 'Unmute my mic' : 'Mute my mic'; $('mute').className = muted ? 'on' : ''; show(); };
 show();

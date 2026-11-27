@@ -677,6 +677,10 @@ on run argv
         repeat with s in sessions of t
           if unique id of s is sid then
             if mode is "tty" then return tty of s
+            if mode is "esc" then
+              tell s to write text (ASCII character 27) newline NO
+              return "ok"
+            end if
             tell s to write text (item 3 of argv) newline NO
             delay 0.15
             tell s to write text ""
@@ -700,6 +704,18 @@ def send(iterm_sid: str, text: str) -> bool:
                        capture_output=True, text=True, timeout=15)
     if r.stdout.strip() != "ok":
         log(f"send failed: {r.stdout.strip() or r.stderr.strip()}")
+        return False
+    return True
+
+
+def press_escape(iterm_sid: str) -> bool:
+    """The Escape key into the pane: Claude Code stops what it is doing (the same as
+    pressing Esc at the desk). One fixed key, never text. The caller checks first that
+    Claude still runs there."""
+    r = subprocess.run(["osascript", "-e", SEND_SCRIPT, iterm_sid.split(":")[-1], "esc"],
+                       capture_output=True, text=True, timeout=15)
+    if r.stdout.strip() != "ok":
+        log(f"escape failed: {r.stdout.strip() or r.stderr.strip()}")
         return False
     return True
 

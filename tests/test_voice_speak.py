@@ -197,6 +197,44 @@ class HookMode(unittest.TestCase):
         r = self.run_hook(json.dumps({**self.payload, "hook_event_name": "UserPromptSubmit"}))
         self.assertIn("SPOKEN", r.stdout)
 
+    def notification(self, kind="permission_prompt", **more):
+        return json.dumps({"hook_event_name": "Notification", "session_id": self.payload["session_id"],
+                           "cwd": "/somewhere/myProject", "message": "Claude needs your permission to use Bash",
+                           "notification_type": kind, **more})
+
+    def test_notification_is_silent_when_voice_is_off(self):
+        self.assertSilentExit0(self.run_hook(self.notification()))
+        self.assertEqual([f.name for f in Path(self.env["TMPDIR"]).glob("claude-*")], [])
+
+    def test_notification_in_a_phone_turn_goes_to_the_phone(self):
+        t, sid = self.phone_turn()
+        self.assertSilentExit0(self.run_hook(self.notification()))
+        self.assertEqual((t / f"claude-talk.notice.{sid}").read_text(), "Claude is asking for permission in myProject.")
+        self.assertTrue((t / f"claude-talk.turn.{sid}").exists(), "the reply is still to come, on the phone")
+        self.assertFalse((t / f"claude-talk.reply.{sid}").exists(), "a notice is not the reply")
+
+    def test_notification_at_the_desk_is_not_a_reply(self):
+        t, sid = Path(self.env["TMPDIR"]), self.payload["session_id"]
+        (t / f"claude-voice.{sid}").touch()
+        self.assertSilentExit0(self.run_hook(self.notification()))
+        self.assertFalse(self.last.exists(), "not 'the last reply'")
+        self.assertFalse((t / f"claude-voice.spoke.{sid}").exists(), "the listener still waits for the real reply")
+        self.assertFalse((t / f"claude-talk.notice.{sid}").exists())
+
+    def test_notification_says_a_fixed_line_never_the_message(self):
+        r = subprocess.run([str(SCRIPT), "--dry-run"], input=self.notification(), capture_output=True,
+                           text=True, env=self.env, timeout=20)
+        self.assertEqual(r.stdout.strip(), "Claude is asking for permission in myProject.")
+        r = subprocess.run([str(SCRIPT), "--dry-run"], input=self.notification("elicitation_dialog", cwd="/x/a;b`c"),
+                           capture_output=True, text=True, env=self.env, timeout=20)
+        self.assertEqual(r.stdout.strip(), "Claude has a question for you in a b c.")
+
+    def test_other_notifications_say_nothing(self):
+        t, sid = self.phone_turn()
+        for kind in ("idle_prompt", "auth_success", "something_new", None):
+            self.assertSilentExit0(self.run_hook(self.notification(kind)))
+        self.assertFalse((t / f"claude-talk.notice.{sid}").exists())
+
     def test_session_flag_speaks_only_that_session(self):
         (Path(self.env["TMPDIR"]) / f"claude-voice.{self.payload['session_id']}").touch()
         self.run_hook(json.dumps(self.payload))

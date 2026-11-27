@@ -42,6 +42,7 @@ vl.log = lambda *a: None   # test sentences must not land in the real listener l
 # and a test must not be able to find one, speak into it, or pause the real desk listener.
 TMP = Path(tempfile.mkdtemp(prefix="voiceloop-test-tmp-"))
 vl.tmp_dir = lambda: TMP
+vl.press_escape = lambda iterm: False   # ...and never a real key into a real pane
 # ...and never the real pairing folder (certificate, key, paired phones).
 os.environ["VOICELOOP_TALK_DIR"] = tempfile.mkdtemp(prefix="voiceloop-test-talk-")
 CFG = {**vl.DEFAULTS, "silence_seconds": 0.3, "preroll": 0.1}
@@ -58,6 +59,7 @@ def make(wake=False, target=PANE, ok=True, **kw):
         return ok
     kw.setdefault("wait_reply", lambda at, sid: out.append(("waited", sid)))
     kw.setdefault("alive", lambda iterm: True)
+    kw.setdefault("escape", lambda iterm: out.append(("escape", iterm)) or True)
     t = vt.Talk(CFG, wake=wake, find=lambda cfg: target, send=send,
                 say_mac=lambda text: out.append(("mac says", text)), **kw)
     t.out = out
@@ -161,6 +163,51 @@ class Heard(unittest.TestCase):
     def test_phone_can_have_its_own_threshold(self):
         self.assertEqual(vt.Talk(CFG, {"threshold": "1.5%"}).cfg["threshold"], "1.5%")
         self.assertEqual(vt.Talk(CFG, {"threshold": ""}).cfg["threshold"], CFG["threshold"])
+
+
+class NotForClaude(unittest.TestCase):
+    """"Stop" and "say that again" are for this server, not for Claude."""
+
+    def test_only_whole_utterances_are_the_phrases(self):
+        for text in ("Stop.", "stop", "Stop it!", "Cancel that.", "Stop, Claude."):
+            self.assertTrue(vt.is_interrupt(text), text)
+        for text in ("Stop the server.", "Please stop.", "Don't stop.", "Stop listening.", "Never mind.", ""):
+            self.assertFalse(vt.is_interrupt(text), text)
+        for text in ("Say that again.", "Repeat that!", "One more time.",
+                     "Let's say that again.", "Can you repeat that?"):      # a misheard wake word in front
+            self.assertTrue(vt.is_again(text), text)
+        for text in ("Run it again.", "Say that again in French.", "Again.",
+                     "Tell the build server to say that again."):
+            self.assertFalse(vt.is_again(text), text)
+
+    def test_nothing_running_means_no_escape(self):
+        t = make()
+        self.assertEqual(t.interrupt()["verdict"], "idle")
+        t.heard("Open the settings file.", 100.0)        # delivered, but run() is not waiting
+        self.assertEqual(t.interrupt()["verdict"], "idle")
+        self.assertNotIn(("escape", PANE["iterm_session"]), t.out)
+
+    def test_stop_said_while_nothing_runs_is_an_ordinary_sentence(self):
+        t = make()
+        self.assertEqual(t.heard("Stop.", 100.0)["verdict"], "send")
+        self.assertEqual(t.out, [("sess-1", "Stop.", None)])
+
+    def test_say_that_again_with_nothing_to_repeat(self):
+        t = make()
+        self.assertEqual(t.heard("Say that again.", 100.0)["verdict"], "noagain")
+        self.assertEqual((t.out, t.again, t.say_again()), ([], False, False))
+
+    def test_say_that_again_is_not_sent_to_claude(self):
+        t = make()
+        t.last_reply = "It worked."
+        self.assertEqual(t.heard("Say that again.", 100.0)["verdict"], "again")
+        self.assertEqual((t.out, t.again), ([], True))
+
+    def test_in_wake_mode_say_that_again_needs_the_wake_word(self):
+        t = make(True)
+        t.last_reply = "It worked."
+        self.assertEqual(t.heard("Say that again.", 100.0)["verdict"], "ignore")
+        self.assertEqual(t.heard("Claude, say that again.", 101.0)["verdict"], "again")
 
 
 class Delivery(unittest.TestCase):
@@ -443,6 +490,41 @@ class Reply(unittest.TestCase):
         t.feed("a", tone(0.6) + silence(0.6))
         return t, q
 
+    def played(self, t, q):
+        e = next_event(q, "reply")
+        t.reply_played(e["id"], "a")
+        next_event(q, "ready")
+        return e
+
+    def test_say_that_again_replays_without_a_new_turn(self):
+        words = iter(["Open the settings file.", "Say that again."])
+        t, q = self.talking()
+        t.stt = lambda c, w: next(words, "")
+        self.played(t, q)
+        self.assertEqual(t.last_reply, "It worked. Second part.")
+        t.feed("a", tone(0.6) + silence(0.6))
+        self.assertEqual(next_event(q, "heard")["verdict"], "again")
+        self.assertEqual(self.played(t, q)["n"], 2)
+        self.assertEqual([o for o in t.out if o[0] == "sess-1"], [("sess-1", "Open the settings file.", None)])
+        self.assertFalse(t.again)
+
+    def test_the_again_button(self):
+        t, q = self.talking()
+        self.assertFalse(t.say_again(), "not while the turn is running")
+        self.played(t, q)
+        t.feed("a", silence(0.1))                        # the page is still there
+        self.assertTrue(t.say_again())
+        self.assertEqual(self.played(t, q)["n"], 2)
+        self.assertEqual(len([o for o in t.out if o[0] == "sess-1"]), 1)
+
+    def test_the_page_learns_that_there_is_something_to_repeat(self):
+        t, q = self.talking()
+        while True:
+            e = next_event(q, "state")
+            if e["state"] == "talking":
+                break
+        self.assertTrue(e["again"])
+
     def test_reply_is_played_on_the_page_piece_by_piece(self):
         t, q = self.talking()
         e = next_event(q, "reply")
@@ -589,7 +671,7 @@ class Worker(unittest.TestCase):
             return "Open the settings file."
         t = self.start(stt)
         q = t.subscribe()
-        self.assertEqual(q.get_nowait(), {"type": "state", "state": "idle", "wake": False, "project": "", "build": vt.BUILD})
+        self.assertEqual(q.get_nowait(), {"type": "state", "state": "idle", "wake": False, "project": "", "build": vt.BUILD, "again": False})
         t.feed("a", silence(0.3) + tone(0.6) + silence(0.6))
         self.assertEqual(next_event(q, "heard")["text"], "Open the settings file.")
         rate, secs = seen[0]
@@ -625,12 +707,12 @@ class Worker(unittest.TestCase):
             next_event(q, "heard", timeout=0.8)
         self.assertEqual(len(t.out), 1)
 
-    def thinking(self, said):
+    def thinking(self, said, **kw):
         """A Talk that has delivered one sentence and is waiting for the reply."""
         self.gate = threading.Event()
         self.addCleanup(self.gate.set)
         words = iter(["Open the settings file."] + said)
-        t = self.start(lambda c, w: next(words, ""))
+        t = self.start(lambda c, w: next(words, ""), **kw)
         t.wait_reply = lambda at, sid: self.gate.wait(5) and None
         q = t.subscribe()
         t.feed("a", tone(0.6) + silence(0.6))
@@ -661,6 +743,84 @@ class Worker(unittest.TestCase):
         self.assertEqual((t.state, t.busy, t.stopped), ("stopped", False, True))
         self.assertFalse(vl.turn_file("sess-1").exists(), "the reply now belongs to the Mac, not the phone")
         self.assertEqual(len(t.out), 1)
+
+    def say(self, t, q):
+        t.feed("a", tone(0.6) + silence(0.6))
+        return next_event(q, "heard")
+
+    def test_stop_presses_escape_while_claude_works(self):
+        vl.turn_file("sess-1").write_text("0")           # as deliver() leaves it
+        t, q = self.thinking(["Stop."])
+        e = self.say(t, q)
+        self.assertEqual((e["verdict"], e["text"]), ("interrupt", "Stop."))
+        self.assertEqual(t.out, [("sess-1", "Open the settings file.", None), ("escape", PANE["iterm_session"])])
+        self.assertFalse(vl.turn_file("sess-1").exists(), "an interrupted turn has no reply for the phone")
+        self.gate.set()
+        next_event(q, "ready")                           # the conversation goes on
+        self.assertEqual((t.busy, t.stopped, t.working), (False, False, None))
+        with self.assertRaises(AssertionError):
+            next_event(q, "reply", timeout=0.5)          # nothing is played for an interrupted turn
+
+    def test_stop_is_pressed_once(self):
+        t, q = self.thinking(["Stop."])
+        self.say(t, q)
+        self.assertEqual(t.interrupt()["verdict"], "idle")
+        self.assertEqual(t.out.count(("escape", PANE["iterm_session"])), 1)
+
+    def test_in_wake_mode_stop_needs_the_wake_word(self):
+        t, q = self.thinking(["Stop.", "Claude, stop."])
+        t.gate.wake = True
+        self.assertEqual(self.say(t, q)["verdict"], "busy")   # a "stop" from the TV does nothing
+        self.assertEqual(len(t.out), 1)
+        self.assertEqual(self.say(t, q)["verdict"], "interrupt")
+        self.assertIn(("escape", PANE["iterm_session"]), t.out)
+
+    def test_stop_inside_a_sentence_is_only_talk(self):
+        t, q = self.thinking(["Please stop the server."])
+        self.assertEqual(self.say(t, q)["verdict"], "busy")
+        self.assertEqual((len(t.out), t.state), (1, "thinking"))
+
+    def test_a_session_without_a_pane_cannot_be_stopped(self):
+        app = {"kind": "app", "claude_session": "sess-1", "cwd": "/somewhere/myProject", "project": "myProject", "wake": None}
+        t, q = self.thinking(["Stop."], target=app)
+        self.assertEqual(self.say(t, q)["verdict"], "cant")
+        self.assertEqual((len(t.out), t.state, t.cancelled), (1, "thinking", False))   # still waiting for the reply
+
+    def test_escape_that_fails_keeps_waiting(self):
+        t, q = self.thinking(["Stop."], escape=lambda iterm: False)
+        self.assertEqual(self.say(t, q)["verdict"], "cant")
+        self.assertEqual((t.state, t.cancelled), ("thinking", False))
+
+    def test_no_escape_into_a_pane_claude_has_left(self):
+        t, q = self.thinking(["Stop."])
+        t.alive = lambda iterm: False                    # Claude quit: Escape would go to the shell
+        self.assertEqual(self.say(t, q)["verdict"], "cant")
+        self.assertEqual(len(t.out), 1)
+
+    def test_a_notice_is_spoken_while_waiting_and_the_wait_goes_on(self):
+        def synth(lines, folder):
+            for i, line in enumerate(lines):
+                Path(folder, f"{i}.wav").write_bytes(b"RIFF" + line.encode())
+        t, q = self.thinking([], synth=synth)
+        t.feed("a", silence(0.1))                        # the page is there
+        vt.notice_file("sess-1").write_text("Claude is asking for permission in myProject.")
+        self.assertEqual(next_event(q, "notice")["text"], "Claude is asking for permission in myProject.")
+        e = next_event(q, "reply")
+        self.assertEqual((e["n"], t.state), (1, "talking"))
+        self.assertFalse(vt.notice_file("sess-1").exists(), "said once")
+        t.reply_played(e["id"], "a")
+        while next_event(q, "state")["state"] != "thinking":
+            pass
+        self.assertEqual((t.busy, t.last_reply), (True, ""))   # a notice is not "the last reply"
+        self.gate.set()
+        next_event(q, "ready")
+
+    def test_an_old_notice_is_not_said_in_the_next_turn(self):
+        vt.notice_file("sess-1").write_text("Claude is asking for permission.")
+        t, q = self.thinking([])
+        self.assertFalse(vt.notice_file("sess-1").exists())
+        with self.assertRaises(AssertionError):
+            next_event(q, "notice", timeout=0.5)
 
     def test_streaming_marks_the_phone_as_the_microphone(self):
         t = self.start(lambda c, w: "")
@@ -745,7 +905,7 @@ class Http(unittest.TestCase):
 
     def test_upload_then_heard_event(self):
         nxt = self.events()
-        self.assertEqual(nxt("state"), {"type": "state", "state": "idle", "wake": True, "project": "", "build": vt.BUILD})
+        self.assertEqual(nxt("state"), {"type": "state", "state": "idle", "wake": True, "project": "", "build": vt.BUILD, "again": False})
         pcm = tone(0.6) + silence(0.6)
         for i in range(0, len(pcm), 6400):               # 200 ms per upload, like the page
             self.assertEqual(self.req("POST", "/api/audio?c=test1", pcm[i:i + 6400])[0], 204)
@@ -780,7 +940,11 @@ class Http(unittest.TestCase):
         self.assertEqual(self.req("POST", "/api/audio?c=x", b"abc")[0], 400)              # half a sample
         self.assertEqual(self.req("POST", "/api/audio", b"ab")[0], 400)                    # no client id
         self.assertEqual(self.req("POST", "/api/audio?c=a/b", b"ab")[0], 400)
-        self.assertEqual(self.req("POST", "/api/audio?c=x", b"\0" * (vt.MAX_BODY + 2))[0], 413)
+        try:
+            status = self.req("POST", "/api/audio?c=x", b"\0" * (vt.MAX_BODY + 2))[0]
+        except (BrokenPipeError, ConnectionResetError):
+            status = 413     # refused from the header alone, and hung up before the upload was through
+        self.assertEqual(status, 413)
         self.assertEqual(self.req("POST", "/api/nope", b"")[0], 404)
         self.assertEqual(self.req("GET", "/api/nope")[0], 404)
 
@@ -796,6 +960,11 @@ class Http(unittest.TestCase):
         self.assertEqual(self.req("POST", "/api/audio?c=forgotten-tab", silence(0.1))[0], 409)
         self.assertEqual(self.req("POST", "/api/start?c=../x", b"")[0], 204)             # no id: nothing taken
         self.assertEqual(self.talk.owner, "visible-tab")
+
+    def test_interrupt_and_again_with_nothing_to_act_on(self):
+        self.assertEqual(json.loads(self.req("POST", "/api/interrupt", b"")[1]), {"verdict": "idle"})
+        self.assertEqual(json.loads(self.req("POST", "/api/again", b"")[1]), {"ok": False})
+        self.assertNotIn(("escape", PANE["iterm_session"]), self.talk.out)
 
     def test_stop_and_start(self):
         nxt = self.events()
@@ -951,7 +1120,8 @@ class FromTheNetwork(unittest.TestCase):
         self.assertNotIn(b"getUserMedia", body)                   # not even the page's code
         self.assertEqual(self.req("GET", "/api/events")[0], 403)
         self.assertEqual(self.req("GET", "/api/reply/abcd1234/0.wav")[0], 403)
-        for path in ("/api/audio?c=x", "/api/start?c=x", "/api/stop", "/api/played?id=abcd1234&c=x"):
+        for path in ("/api/audio?c=x", "/api/start?c=x", "/api/stop", "/api/played?id=abcd1234&c=x",
+                     "/api/interrupt", "/api/again"):
             self.assertEqual(self.req("POST", path, tone(0.1))[0], 403, path)
         self.assertEqual(len(self.talk.stream.buf), 0)
         self.assertFalse(self.talk.stopped)
