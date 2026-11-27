@@ -259,7 +259,9 @@ page: state, what was heard                    <--events- (server-sent events)
   never dropped.
 - **One microphone at a time.** While a page streams, the desk microphone rests. With several
   pages open, the one tapped last talks.
-- **Half-duplex.** The page doesn't listen while Claude works or while the reply plays.
+- **Half-duplex.** Nothing is sent while Claude works or while the reply plays. While Claude
+  works the page still listens for one thing, "stop listening"; anything else is shown as
+  "Claude is still working" and dropped, so talk in the room can't queue up messages.
 - **Settings:** `"talk": {"port": 8445, "tls_port": 8444, "threshold": ""}` in `config.json`
   (`threshold`: the phone is a different microphone, so it can have its own).
 

@@ -614,13 +614,50 @@ class Worker(unittest.TestCase):
         q = t.subscribe()
         t.feed("a", tone(0.6) + silence(0.6))
         next_event(q, "heard")
-        t.feed("a", tone(0.6) + silence(0.6))        # said while Claude is busy
-        time.sleep(0.3)
+        t.feed("a", tone(0.3))                       # still talking when the reply arrives
+        time.sleep(0.2)
         gate.set()
         next_event(q, "ready")
         self.assertEqual(len(t.stream.buf), 0)       # thrown away, not sent late
         with self.assertRaises(AssertionError):
             next_event(q, "heard", timeout=0.8)
+        self.assertEqual(len(t.out), 1)
+
+    def thinking(self, said):
+        """A Talk that has delivered one sentence and is waiting for the reply."""
+        self.gate = threading.Event()
+        self.addCleanup(self.gate.set)
+        words = iter(["Open the settings file."] + said)
+        t = self.start(lambda c, w: next(words, ""))
+        t.wait_reply = lambda at, sid: self.gate.wait(5) and None
+        q = t.subscribe()
+        t.feed("a", tone(0.6) + silence(0.6))
+        self.assertEqual(next_event(q, "heard")["verdict"], "send")
+        while next_event(q, "state")["state"] != "thinking":
+            pass
+        time.sleep(0.15)       # the wait starts by throwing away what was said before it
+        return t, q
+
+    def test_while_claude_works_other_talk_is_shown_but_not_sent(self):
+        t, q = self.thinking(["Turn the volume up please."])
+        t.feed("a", tone(0.6) + silence(0.6))
+        e = next_event(q, "heard")
+        self.assertEqual((e["verdict"], e["text"]), ("busy", "Turn the volume up please."))
+        self.assertEqual(t.state, "thinking")
+        self.gate.set()
+        next_event(q, "ready")
+        self.assertEqual(len(t.out), 1)                  # only the first sentence ever reached Claude
+
+    def test_stop_listening_works_while_claude_works(self):
+        vl.turn_file("sess-1").write_text("0")           # as deliver() leaves it
+        t, q = self.thinking(["Claude, stop listening."])
+        t.feed("a", tone(0.6) + silence(0.6))
+        self.assertEqual(next_event(q, "heard")["verdict"], "stop")
+        deadline = time.time() + 5
+        while t.busy and time.time() < deadline:
+            time.sleep(0.02)
+        self.assertEqual((t.state, t.busy, t.stopped), ("stopped", False, True))
+        self.assertFalse(vl.turn_file("sess-1").exists(), "the reply now belongs to the Mac, not the phone")
         self.assertEqual(len(t.out), 1)
 
     def test_streaming_marks_the_phone_as_the_microphone(self):

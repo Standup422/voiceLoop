@@ -564,9 +564,8 @@ class WaitForReply(unittest.TestCase):
         self.assertLess(time.time() - t0, 1.0)
 
 
-class ListenOnce(unittest.TestCase):
-    """App mode (desktop app Code tab): listen_once with a fake recorder + transcriber.
-    Each script step is (record_status, transcript)."""
+class OnceCase(unittest.TestCase):
+    """Shared setup for listen_once tests: a temp $TMPDIR, no sounds, a fake recorder."""
 
     def setUp(self):
         d = tempfile.TemporaryDirectory()
@@ -595,6 +594,11 @@ class ListenOnce(unittest.TestCase):
 
         return vl.listen_once(self.cfg, timeout, wake=wake, rec=rec, stt=lambda c, w: self.current,
                               claude_sid=sid)
+
+
+class ListenOnce(OnceCase):
+    """App mode (desktop app Code tab): listen_once with a fake recorder + transcriber.
+    Each script step is (record_status, transcript)."""
 
     def test_returns_first_usable_utterance(self):
         r = self.run_once([("ok", ""), ("ok", "What time is it?")])
@@ -645,7 +649,7 @@ class ListenOnce(unittest.TestCase):
         self.assertEqual(self.run_once([("ok", "hello")])["status"], "busy")
 
 
-class PhoneInbox(ListenOnce):
+class PhoneInbox(OnceCase):
     """The Talk page (voice-talk.py) as a second source for `listen once`."""
 
     def test_phone_live_follows_the_markers_age(self):

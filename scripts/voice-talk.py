@@ -27,6 +27,7 @@
 #          session, so neither pairing nor HTTPS is optional there.
 # Usage:   voice-talk.py [--port 8445] [--tls-port 8444] [--local] [--wake | --no-wake]
 #                        [--project <name>] [--cwd <folder>]          run the server
+#          (also as `voice talk …`, e.g. `voice talk pair`)
 #          voice-talk.py setup            make the HTTPS certificate with mkcert (no sudo)
 #          voice-talk.py ca               show a QR code to put this Mac's certificate
 #                                         authority on a phone (once per phone), with the steps
@@ -58,8 +59,9 @@
 #          Heard text goes to the page and to the listener log, never to /api/status.
 #          While a page streams, the desk microphone rests (one input at a time): this
 #          script touches $TMPDIR/claude-talk.live and voice-listen.py watches it.
-#          After a delivery the page is deaf until the reply has been played (half-duplex,
-#          like the desk). If the page went away meanwhile, the reply is spoken on the Mac.
+#          After a delivery nothing is sent until the reply has been played (half-duplex,
+#          like the desk). While Claude works, the page still listens for one thing, "stop
+#          listening"; anything else is shown as "Claude is still working" and dropped. If the page went away meanwhile, the reply is spoken on the Mac.
 #          Reply audio lives in a temp folder only while it plays. Typing into iTerm needs the Automation permission of the app
 #          this server was started from. Not on the phone: "switch to <project>" (the
 #          phone follows the desk).
@@ -343,6 +345,7 @@ class Talk:
         self.say_mac = say_mac or vl.say_local
         self.alive = alive or vl.claude_in_pane
         self.busy = False            # the worker is waiting for, or playing, a reply
+        self.waiting_sid = ""        # the session whose reply we are waiting for
         self.reply = None            # {"id", "dir", "n", "done"}: the reply being played right now
         self.played = threading.Event()
         self.wake_forced = wake is not None
@@ -430,6 +433,8 @@ class Talk:
         self.stream.clear()
         self.gate.pending, self.confirm = "", None
         self.played.set()                # stop speaking: the worker stops waiting for the page
+        if self.waiting_sid:             # a reply still to come is no longer the phone's
+            vl.turn_file(self.waiting_sid).unlink(missing_ok=True)
         release_voice()
         self.set_state("stopped")
 
@@ -550,7 +555,8 @@ class Talk:
         verdict: send (delivered) | command (an allowed slash command, delivered) |
         ask (a command that needs a spoken yes; the question is in "ask") | cancelled |
         hold (sounds unfinished) | ignore (no wake word) | yes (wake word alone) | stop |
-        nowhere (no Claude session to deliver to)"""
+        nowhere (no Claude session to deliver to) | busy (said while Claude was still working:
+        not sent; only the stop phrase counts then, see _await())"""
         if target is False:
             target = self.resolve()
         ask = ""
@@ -593,6 +599,40 @@ class Talk:
             self.set_state("idle")
         return self.stopped or self.closed
 
+    def _await(self, sent_at: float, sid: str, wav: str, cwd: str):
+        """Wait for the reply, and meanwhile keep listening for ONE thing: the stop phrase.
+        (A long task used to leave the phone deaf for minutes, with no way out.) Anything
+        else said now is shown as "busy" and NOT sent: a TV in the room must not queue up
+        messages for Claude. Returns what wait_reply returns."""
+        box = []
+
+        def wait():
+            try:
+                box.append(self.wait_reply(sent_at, sid))
+            except Exception as e:   # noqa: BLE001
+                vl.log(f"talk: waiting for the reply failed: {e!r}")
+                box.append(None)
+        th = threading.Thread(target=wait, daemon=True)
+        th.start()
+        self.stream.clear()
+        while th.is_alive() and not (self.stopped or self.closed):
+            status, pcm = vl.capture(self.stream, self.cfg,
+                                     interrupted=lambda: not th.is_alive() or self.stopped or self.closed)
+            if status != "ok" or not th.is_alive():
+                continue
+            try:
+                vl.write_wav(wav, pcm)
+                text = self.stt(vl.effective(self.cfg, cwd), wav)
+            except Exception as e:   # noqa: BLE001
+                vl.log(f"talk: utterance failed: {e!r}")
+                continue
+            if not text or not th.is_alive():
+                continue
+            said = vl.strip_wake(text, self.gate.extra)[0]
+            self._tell("stop" if vl.is_stop(said, self.cfg) else "busy", said)   # "stop" calls stop()
+        th.join(3)
+        return box[0] if box else None
+
     def run(self) -> None:
         with tempfile.TemporaryDirectory(prefix="voiceloop-talk-") as td:
             wav = os.path.join(td, "utt.wav")
@@ -616,15 +656,16 @@ class Talk:
                 if sent and not self.stopped:
                     # Half-duplex, as at the desk: deaf until the reply has been spoken.
                     sid, at, expect = sent
-                    self.busy = True
+                    self.busy, self.waiting_sid = True, sid
                     self.set_state("thinking")
                     try:
-                        text = self.wait_reply(at, sid) if expect else time.sleep(1.0)
+                        text = self._await(at, sid, wav, (target or {}).get("cwd") or self.cwd) \
+                            if expect else time.sleep(1.0)
                         if text and not self.stopped:
                             self.speak_reply(text)
                     except Exception as e:   # noqa: BLE001
                         vl.log(f"talk: the reply failed: {e!r}")
-                    self.busy = False
+                    self.busy, self.waiting_sid = False, ""
                     self.gate.replied(time.time())   # a reply invites an answer
                     self.stream.clear()              # whatever the mic picked up meanwhile
                     self.publish({"type": "ready"})
@@ -710,10 +751,8 @@ def unpair(name: str) -> list:
     """Forget the phone with this name ("all" = every phone). Returns the names removed."""
     with _FILES:
         known = phones()
-        gone = [h for h, p in known.items() if name == "all" or p.get("name", "").lower() == name.lower()]
-        for h in gone:
-            removed = known.pop(h)
-            gone[gone.index(h)] = removed.get("name", "?")
+        hashes = [h for h, p in known.items() if name == "all" or p.get("name", "").lower() == name.lower()]
+        gone = [known.pop(h).get("name", "?") for h in hashes]
         _write("phones.json", known)
     return gone
 
@@ -766,7 +805,7 @@ def lan_ips() -> list:
 # --- the web server ---------------------------------------------------------------
 NOT_PAIRED = """<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>voiceLoop Talk</title><body style="font:18px/1.5 -apple-system,system-ui,sans-serif;background:#111;color:#eee;padding:24px">
-<h2>%s</h2><p>On the Mac, run <b>voice-talk.py pair</b> and scan the QR code it shows with this phone.</p>"""
+<h2>%s</h2><p>On the Mac, run <b>voice talk pair</b> and scan the QR code it shows with this phone.</p>"""
 PAIRED_OK = """<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>voiceLoop Talk</title><body style="font:18px/1.5 -apple-system,system-ui,sans-serif;background:#111;color:#eee;padding:24px">
 <h2>Paired.</h2><p><a style="color:#2f7" href="/">Open the Talk page</a></p><script>location.replace('/')</script>"""
@@ -975,7 +1014,7 @@ PAGE = r"""<!doctype html>
   .bar { height: 22px; background: #333; border-radius: 8px; overflow: hidden; margin: 14px 0; }
   .bar i { display: block; height: 100%; width: 0; background: #2f7; }
   #heard { min-height: 3em; margin-top: 18px; color: #9c9; }
-  #heard.ignore, #heard.cancelled { color: #888; }
+  #heard.ignore, #heard.cancelled, #heard.busy { color: #888; }
   #heard.nowhere { color: #e88; }
   #heard.hold { color: #cc8; }
   #why { color: #888; font-size: 14px; min-height: 1.4em; }
@@ -997,7 +1036,8 @@ const CLIENT = Array.from(crypto.getRandomValues(new Uint8Array(9)), b => b.toSt
 const LABEL = { idle: 'Ready', listening: 'Listening', transcribing: 'Got it…', thinking: 'Thinking…', talking: 'Talking', stopped: 'Stopped' };
 const WHY = { send: 'sent to Claude', command: 'command sent', cancelled: 'cancelled', hold: 'sounds unfinished, go on…',
   ignore: 'heard, but ignored (no wake word)', yes: 'Yes?', stop: 'stopped listening',
-  nowhere: 'not sent: no Claude session is active at the desk' };
+  nowhere: 'not sent: no Claude session is active at the desk',
+  busy: 'not sent: Claude is still working. Say “stop listening” to end.' };
 let ctx = null, stream = null, timer = null, out = [], muted = false, quietUntil = 0, server = 'idle', lost = false, busy = false, info = [];
 let playing = false, source = null;
 
@@ -1166,9 +1206,9 @@ def setup_cli() -> int:
         print(f"certificate: made for {', '.join(dict.fromkeys(names))}")
     print(f"""
 Next:
-  1. Each phone must trust this Mac's certificate authority, once:   voice-talk.py ca
-  2. Start the server:                                                voice-talk.py
-  3. Pair a phone (one QR code per phone, valid 10 minutes):          voice-talk.py pair
+  1. Each phone must trust this Mac's certificate authority, once:   voice talk ca
+  2. Start the server:                                                voice talk
+  3. Pair a phone (one QR code per phone, valid 10 minutes):          voice talk pair
 The phone's address will be https://{host.lower()}.local:{load_talk_config()['tls_port']}/
 (same Wi-Fi network; if macOS asks whether to allow incoming connections, allow them).""")
     return 0
@@ -1183,7 +1223,7 @@ def ca_cli(seconds: int = 600) -> int:
                                    timeout=10).stdout.strip()) / "rootCA.pem"
         pem = root.read_bytes()
     except (OSError, subprocess.SubprocessError):
-        print("No certificate authority yet: run voice-talk.py setup first.", file=sys.stderr)
+        print("No certificate authority yet: run voice talk setup first.", file=sys.stderr)
         return 1
     ips = lan_ips()
     if not ips:
@@ -1227,13 +1267,13 @@ This only ever sends the PUBLIC certificate. Serving for {seconds // 60} minutes
 def pair_cli(show: bool) -> int:
     cert, key = cert_files()
     if not (cert.exists() and key.exists()):
-        print("No certificate yet: run voice-talk.py setup first.", file=sys.stderr)
+        print("No certificate yet: run voice talk setup first.", file=sys.stderr)
         return 1
     url = f"https://{host_name().lower()}.local:{load_talk_config()['tls_port']}/pair?s={new_pairing()}"
     print(f"Pair ONE phone: scan this within {PAIR_SECONDS // 60} minutes (it works once).\n")
     if not qr(url):
         print("(no QR code: brew install qrencode)")
-    print(f"\n{url}\n\nThe server must be running (voice-talk.py), and the phone on the same network.")
+    print(f"\n{url}\n\nThe server must be running (voice talk), and the phone on the same network.")
     if show:
         png = str(talk_dir() / "pair.png")
         if qr(url, png):
@@ -1246,7 +1286,7 @@ def phones_cli() -> int:
     for p in sorted(known.values(), key=lambda p: p.get("paired_at", 0)):
         print(f"{p.get('name', '?'):<16} paired {time.strftime('%Y-%m-%d %H:%M', time.localtime(p.get('paired_at', 0)))}")
     if not known:
-        print("No phone is paired. (voice-talk.py pair)")
+        print("No phone is paired. (voice talk pair)")
     return 0
 
 
@@ -1262,7 +1302,7 @@ def main() -> int:
         return phones_cli()
     if sub == "unpair":
         gone = unpair(" ".join(sys.argv[2:]).strip()) if sys.argv[2:] else []
-        print("Forgot: " + ", ".join(gone) if gone else "usage: voice-talk.py unpair <name>|all   (names: voice-talk.py phones)")
+        print("Forgot: " + ", ".join(gone) if gone else "usage: voice talk unpair <name>|all   (names: voice talk phones)")
         return 0 if gone else 1
     cfg, tcfg = vl.load_config(), load_talk_config()
     ap = argparse.ArgumentParser(description="voiceLoop Talk page: a browser or a paired phone as the "
@@ -1285,7 +1325,7 @@ def main() -> int:
     except OSError as e:
         print(f"voice-talk: port {a.port} is not free ({e.strerror}). Try --port.", file=sys.stderr)
         return 1
-    servers, phone_line = [srv], "phones: off (voice-talk.py setup makes the certificate)"
+    servers, phone_line = [srv], "phones: off (voice talk setup makes the certificate)"
     cert, key = cert_files()
     if a.local:
         phone_line = "phones: off (--local)"
@@ -1293,7 +1333,7 @@ def main() -> int:
         try:
             servers.append(make_tls_server(talk, a.tls_port, cert, key))
             phone_line = (f"phones: https://{host_name().lower()}.local:{a.tls_port}/  "
-                          f"({len(phones())} paired; pair one with: voice-talk.py pair)")
+                          f"({len(phones())} paired; pair one with: voice talk pair)")
         except (OSError, ssl.SSLError) as e:
             phone_line = f"phones: off ({e})"
     for f in vl.tmp_dir().glob("claude-talk.turn.*"):   # turns a previous run was waiting on:

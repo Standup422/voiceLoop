@@ -170,8 +170,8 @@ How it behaves:
   phone needs "Claude, …" too.
 - **The page must stay in front.** A phone browser stops the microphone when the page is
   hidden or the phone locks; the page keeps the screen on while it listens. Tap once to start again.
-- **While Claude works, and while the reply plays, the page does not listen.** A beep tells
-  you it's your turn.
+- **While Claude works, and while the reply plays, nothing you say is sent.** A beep tells
+  you it's your turn. "Stop listening" still works while Claude works.
 - **Permission prompts appear on the Mac,** not on the phone.
 - Say "stop listening" to end it.
 
